@@ -4,6 +4,9 @@ type JsonEvent = {
   type: string;
   part?: Record<string, unknown>;
   sessionID?: string;
+  error?: unknown;
+  message?: unknown;
+  [key: string]: unknown;
 };
 
 function safeJsonParse(text: string): JsonEvent | null {
@@ -160,7 +163,8 @@ export function formatEvent(line: string, debug: boolean): string {
 
 /**
  * Parse a single stdout line into transcript entries for UI display.
- * This is the Paperclip UI parser contract.
+ * This is the Paperclip UI parser contract — uses rich TranscriptEntry kinds
+ * so the UI renders structured assistant messages, tool calls, and results.
  */
 export function parseStdoutLine(line: string, ts: string): TranscriptEntry[] {
   const trimmed = line.trim();
@@ -168,7 +172,6 @@ export function parseStdoutLine(line: string, ts: string): TranscriptEntry[] {
 
   const event = safeJsonParse(trimmed);
   if (!event) {
-    // Non-JSON — treat as raw text
     return [{ kind: "stdout", ts, text: trimmed }];
   }
 
@@ -176,24 +179,77 @@ export function parseStdoutLine(line: string, ts: string): TranscriptEntry[] {
   const part = asRecord(event.part ?? {});
 
   if (type === "text") {
-    const text = asString(part.text, "").trim();
-    if (text) return [{ kind: "stdout", ts, text }];
+    const text = asString(part.text, "");
+    if (text) return [{ kind: "assistant", ts, text, delta: true }];
     return [];
+  }
+
+  if (type === "tool_use") {
+    const toolName = asString(part.tool, "") || asString(part.type, "tool");
+    const state = asRecord(part.state ?? {});
+    const status = asString(state.status, "");
+    const toolUseId = asString(part.id ?? part.toolUseId ?? "", "") || toolName;
+    const description = asString(state.description, "").trim();
+
+    if (status === "error") {
+      const err = asString(state.error, "").trim();
+      return [{ kind: "tool_result", ts, toolUseId, toolName, content: err || "Tool error", isError: true }];
+    }
+    if (status === "completed" || status === "done") {
+      const output = asString(state.output, "").trim();
+      return [{ kind: "tool_result", ts, toolUseId, toolName, content: output || description || "Done", isError: false }];
+    }
+    return [{ kind: "tool_call", ts, name: toolName, input: description || undefined, toolUseId }];
   }
 
   if (type === "step_finish") {
-    const text = asString(part.message, "").trim();
-    if (text) return [{ kind: "stdout", ts, text }];
-    return [];
+    const message = asString(part.message, "").trim();
+    const reason = asString(part.reason, "");
+    const tokens = asRecord(part.tokens ?? {});
+    const cache = asRecord(tokens.cache ?? {});
+    const inputTokens = asNumber(tokens.input, 0);
+    const outputTokens = asNumber(tokens.output, 0) + asNumber(tokens.reasoning, 0);
+    const cachedTokens = asNumber(cache.read, 0);
+    const costUsd = asNumber(part.cost, 0);
+
+    return [{
+      kind: "result",
+      ts,
+      text: message || `Step finished: ${reason || "done"}`,
+      inputTokens,
+      outputTokens,
+      cachedTokens,
+      costUsd,
+      subtype: reason || "step_finish",
+      isError: false,
+      errors: [],
+    }];
   }
 
-  // Skip non-display events (step_start, tool_use in normal mode)
-  if (type === "step_start" || type === "tool_use") {
+  if (type === "step_start") {
+    return [{ kind: "system", ts, text: "Starting step…" }];
+  }
+
+  if (type === "assistant") {
+    const content = part.message ?? part;
+    const contentRecord = asRecord(content);
+    if (contentRecord.content) {
+      const contentArr = Array.isArray(contentRecord.content)
+        ? contentRecord.content
+        : [contentRecord.content];
+      for (const item of contentArr) {
+        const itemRecord = asRecord(item);
+        if (itemRecord.type === "text" && typeof itemRecord.text === "string") {
+          const text = (itemRecord.text as string).trim();
+          if (text) return [{ kind: "assistant", ts, text }];
+        }
+      }
+    }
     return [];
   }
 
   if (type === "error") {
-    const text = errorText(event).trim();
+    const text = errorText(event.error ?? event.message ?? event).trim();
     if (text) return [{ kind: "stderr", ts, text }];
     return [];
   }
