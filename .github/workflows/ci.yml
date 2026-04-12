@@ -33,5 +33,18 @@ jobs:
           cache: "npm"
       - run: npm ci
       - run: npm run build
+      - name: Check if version already published
+        id: version-check
+        run: |
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
+          PUBLISHED_VERSION=$(npm view @farhoodliquor/paperclip-adapter-opencode-k8s version 2>/dev/null || echo "")
+          echo "Current: $CURRENT_VERSION, Published: $PUBLISHED_VERSION"
+          if [ "$CURRENT_VERSION" = "$PUBLISHED_VERSION" ]; then
+            echo "already_published=true" >> $GITHUB_OUTPUT
+          else
+            echo "already_published=false" >> $GITHUB_OUTPUT
+          fi
       - run: echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" > .npmrc
+        if: steps.version-check.outputs.already_published == 'false'
       - run: npm publish --access public
+        if: steps.version-check.outputs.already_published == 'false'
