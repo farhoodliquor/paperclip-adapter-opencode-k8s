@@ -63,3 +63,4 @@ Notes:
 `;
 
 export { createServerAdapter } from "./server/index.js";
+export { parseStdoutLine } from "./ui-parser.js";
