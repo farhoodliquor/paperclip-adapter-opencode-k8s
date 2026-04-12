@@ -1,20 +1,4 @@
-// Local type augmentation for adapter-utils version that has getConfigSchema.
-// The deployed environment has a newer version of adapter-utils with these types.
-interface ConfigFieldSchema {
-  key: string;
-  label: string;
-  type: "text" | "select" | "toggle" | "number" | "textarea" | "combobox";
-  options?: { label: string; value: string }[];
-  default?: unknown;
-  hint?: string;
-  required?: boolean;
-  group?: string;
-  meta?: Record<string, unknown>;
-}
-
-interface AdapterConfigSchema {
-  fields: ConfigFieldSchema[];
-}
+import type { AdapterConfigSchema } from "@paperclipai/adapter-utils";
 
 export function getConfigSchema(): AdapterConfigSchema {
   return {

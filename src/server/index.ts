@@ -15,7 +15,7 @@ export function createServerAdapter(): ServerAdapterModule {
     supportsLocalAgentJwt: true,
     agentConfigurationDoc,
     getConfigSchema,
-  } as ServerAdapterModule;
+  };
 }
 
 export { execute, testEnvironment, sessionCodec };
