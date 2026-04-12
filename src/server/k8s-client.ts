@@ -20,19 +20,9 @@ export interface SelfPodInfo {
   dnsConfig: k8s.V1PodDNSConfig | undefined;
   pvcClaimName: string | null;
   secretVolumes: SelfPodSecretVolume[];
-  /** Env vars inherited from the Deployment container. */
+  /** Env vars read directly from the pod spec's container definition. */
   inheritedEnv: Record<string, string>;
 }
-
-/** Keys forwarded from the Deployment container env into Job pods. */
-const INHERITED_ENV_KEYS = [
-  "CLAUDE_CODE_USE_BEDROCK",
-  "AWS_REGION",
-  "AWS_BEARER_TOKEN_BEDROCK",
-  "ANTHROPIC_API_KEY",
-  "OPENAI_API_KEY",
-  "PAPERCLIP_API_URL",
-];
 
 let cachedSelfPod: SelfPodInfo | null = null;
 
@@ -141,13 +131,12 @@ export async function getSelfPodInfo(kubeconfigPath?: string): Promise<SelfPodIn
     }
   }
 
-  // Collect inherited env vars from process.env (these came from the Deployment spec)
+  // Collect all env vars directly from the pod spec container definition.
+  // This gives the authoritative env the container was configured with in K8s —
+  // no static allowlist needed; any env var from the Deployment is forwarded.
   const inheritedEnv: Record<string, string> = {};
-  for (const key of INHERITED_ENV_KEYS) {
-    const value = process.env[key];
-    if (value !== undefined) {
-      inheritedEnv[key] = value;
-    }
+  for (const envVar of mainContainer.env ?? []) {
+    if (envVar.value) inheritedEnv[envVar.name] = envVar.value;
   }
 
   cachedSelfPod = {
