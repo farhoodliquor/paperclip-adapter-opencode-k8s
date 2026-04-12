@@ -1,4 +1,4 @@
-# @farhoodliquor/paperclip-adapter-opencode-k8s
+# OpenCode (Kubernetes) Paperclip Adapter Plugin
 
 Paperclip adapter plugin that runs OpenCode agents as isolated Kubernetes Jobs instead of inside the main Paperclip process.
 
