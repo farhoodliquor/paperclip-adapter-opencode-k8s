@@ -1,4 +1,4 @@
-# paperclip-adapter-opencode-k8s
+# @farhoodliquor/paperclip-adapter-opencode-k8s
 
 Paperclip adapter plugin that runs OpenCode agents as isolated Kubernetes Jobs instead of inside the main Paperclip process.
 
@@ -19,7 +19,7 @@ Paperclip adapter plugin that runs OpenCode agents as isolated Kubernetes Jobs i
 ```bash
 curl -X POST http://localhost:3100/api/adapters \
   -H "Content-Type: application/json" \
-  -d '{"packageName": "paperclip-adapter-opencode-k8s"}'
+  -d '{"packageName": "@farhoodliquor/paperclip-adapter-opencode-k8s"}'
 ```
 
 ### Local Development
@@ -27,7 +27,7 @@ curl -X POST http://localhost:3100/api/adapters \
 ```bash
 curl -X POST http://localhost:3100/api/adapters \
   -H "Content-Type: application/json" \
-  -d '{"localPath": "/path/to/paperclip-opencode-k8s"}'
+  -d '{"localPath": "/path/to/paperclip-adapter-opencode-k8s"}'
 ```
 
 ## Configuration
@@ -45,8 +45,8 @@ See the agent configuration documentation for all available fields:
 
 ## Requirements
 
+- **Paperclip must be deployed on a Kubernetes cluster with a shared RWX PVC mounted at `/paperclip`** — this is required for session resume and workspace sharing between the Paperclip pod and agent Job pods
 - Kubernetes cluster with RBAC permissions to create Jobs, list Pods, and read Pod logs
-- Shared RWX PVC mounted at `/paperclip` for session resume and workspace access
 - `@paperclipai/adapter-utils` >= 0.3.0
 
 ## License
