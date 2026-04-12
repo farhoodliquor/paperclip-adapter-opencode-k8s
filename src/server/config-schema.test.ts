@@ -21,15 +21,18 @@ describe("getConfigSchema", () => {
 
     expect(uniqueGroups).toContain("Core");
     expect(uniqueGroups).toContain("Kubernetes");
-    expect(uniqueGroups).toContain("Operational");
   });
 
-  it("has model as required text field", () => {
+  it("does not include platform-provided fields", () => {
     const schema = getConfigSchema();
-    const modelField = schema.fields.find((f: ConfigFieldSchema) => f.key === "model");
-    expect(modelField).toBeDefined();
-    expect(modelField!.type).toBe("text");
-    expect(modelField!.required).toBe(true);
+    const keys = schema.fields.map((f: ConfigFieldSchema) => f.key);
+    // These fields are provided by the platform and should not be duplicated
+    expect(keys).not.toContain("model");
+    expect(keys).not.toContain("promptTemplate");
+    expect(keys).not.toContain("env");
+    expect(keys).not.toContain("extraArgs");
+    expect(keys).not.toContain("timeoutSec");
+    expect(keys).not.toContain("graceSec");
   });
 
   it("has imagePullPolicy as select with correct options", () => {
@@ -60,22 +63,6 @@ describe("getConfigSchema", () => {
     expect(field!.default).toBe(300);
   });
 
-  it("timeoutSec defaults to 0", () => {
-    const schema = getConfigSchema();
-    const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "timeoutSec");
-    expect(field).toBeDefined();
-    expect(field!.type).toBe("number");
-    expect(field!.default).toBe(0);
-  });
-
-  it("graceSec defaults to 60", () => {
-    const schema = getConfigSchema();
-    const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "graceSec");
-    expect(field).toBeDefined();
-    expect(field!.type).toBe("number");
-    expect(field!.default).toBe(60);
-  });
-
   it("retainJobs is a toggle", () => {
     const schema = getConfigSchema();
     const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "retainJobs");
@@ -98,14 +85,14 @@ describe("getConfigSchema", () => {
     }
   });
 
-  it("has env and extraArgs as textarea", () => {
+  it("has nodeSelector and tolerations as textarea", () => {
     const schema = getConfigSchema();
-    const envField = schema.fields.find((f: ConfigFieldSchema) => f.key === "env");
-    expect(envField).toBeDefined();
-    expect(envField!.type).toBe("textarea");
+    const nodeField = schema.fields.find((f: ConfigFieldSchema) => f.key === "nodeSelector");
+    expect(nodeField).toBeDefined();
+    expect(nodeField!.type).toBe("textarea");
 
-    const extraArgsField = schema.fields.find((f: ConfigFieldSchema) => f.key === "extraArgs");
-    expect(extraArgsField).toBeDefined();
-    expect(extraArgsField!.type).toBe("textarea");
+    const tolField = schema.fields.find((f: ConfigFieldSchema) => f.key === "tolerations");
+    expect(tolField).toBeDefined();
+    expect(tolField!.type).toBe("textarea");
   });
 });

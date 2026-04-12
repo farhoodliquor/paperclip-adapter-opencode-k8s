@@ -3,15 +3,7 @@ import type { AdapterConfigSchema } from "@paperclipai/adapter-utils";
 export function getConfigSchema(): AdapterConfigSchema {
   return {
     fields: [
-      // Core fields
-      {
-        key: "model",
-        label: "Model",
-        type: "text",
-        hint: "OpenCode model id in provider/model format (e.g. anthropic/claude-sonnet-4-6)",
-        required: true,
-        group: "Core",
-      },
+      // Core fields (model, promptTemplate, env, extraArgs are provided by the platform)
       {
         key: "variant",
         label: "Variant",
@@ -25,27 +17,6 @@ export function getConfigSchema(): AdapterConfigSchema {
         type: "toggle",
         default: true,
         hint: "Inject runtime config with permission.external_directory=allow",
-        group: "Core",
-      },
-      {
-        key: "promptTemplate",
-        label: "Prompt Template",
-        type: "text",
-        hint: "Run prompt template",
-        group: "Core",
-      },
-      {
-        key: "extraArgs",
-        label: "Extra Arguments",
-        type: "textarea",
-        hint: "JSON array of additional CLI args appended to the opencode command",
-        group: "Core",
-      },
-      {
-        key: "env",
-        label: "Environment Variables",
-        type: "textarea",
-        hint: "KEY=VALUE pairs, one per line. Overrides inherited vars from the Deployment.",
         group: "Core",
       },
 
@@ -148,23 +119,7 @@ export function getConfigSchema(): AdapterConfigSchema {
         group: "Kubernetes",
       },
 
-      // Operational fields
-      {
-        key: "timeoutSec",
-        label: "Timeout (seconds)",
-        type: "number",
-        default: 0,
-        hint: "Run timeout in seconds; 0 means no timeout",
-        group: "Operational",
-      },
-      {
-        key: "graceSec",
-        label: "Grace Period (seconds)",
-        type: "number",
-        default: 60,
-        hint: "Additional grace before adapter gives up after Job deadline",
-        group: "Operational",
-      },
+      // Operational fields (timeoutSec and graceSec are provided by the platform)
     ],
   };
 }
