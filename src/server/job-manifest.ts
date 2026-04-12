@@ -187,7 +187,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // Job naming
   const agentSlug = sanitizeForK8sName(agent.id);
   const runSlug = sanitizeForK8sName(runId);
-  const jobName = `agent-${agentSlug}-${runSlug}`;
+  const jobName = `agent-opencode-${agentSlug}-${runSlug}`;
 
   // Build prompt
   const promptTemplate = asString(
@@ -306,6 +306,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     runAsUser: 1000,
     runAsGroup: 1000,
     fsGroup: 1000,
+    fsGroupChangePolicy: "OnRootMismatch",
   };
 
   // Build the main container command

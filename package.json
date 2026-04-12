@@ -1,6 +1,6 @@
 {
   "name": "@farhoodliquor/paperclip-adapter-opencode-k8s",
-  "version": "0.1.0",
+  "version": "0.1.5",
   "description": "Paperclip adapter plugin that runs OpenCode agents as Kubernetes Jobs",
   "license": "MIT",
   "type": "module",
@@ -18,7 +18,9 @@
   "scripts": {
     "build": "tsc",
     "clean": "rm -rf dist",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@kubernetes/client-node": "^1.0.0"
@@ -29,6 +31,7 @@
   "devDependencies": {
     "@paperclipai/adapter-utils": "^0.3.0",
     "@types/node": "^24.6.0",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "vitest": "^4.1.4"
   }
 }

@@ -1,13 +1,7 @@
 export const type = "opencode_k8s";
 export const label = "OpenCode (Kubernetes)";
 
-export const models = [
-  { id: "openai/gpt-5.2-codex", label: "openai/gpt-5.2-codex" },
-  { id: "openai/gpt-5.4", label: "openai/gpt-5.4" },
-  { id: "openai/gpt-5.2", label: "openai/gpt-5.2" },
-  { id: "openai/gpt-5.1-codex-max", label: "openai/gpt-5.1-codex-max" },
-  { id: "openai/gpt-5.1-codex-mini", label: "openai/gpt-5.1-codex-mini" },
-];
+export const models: undefined = undefined;
 
 export const agentConfigurationDoc = `# opencode_k8s agent configuration
 
