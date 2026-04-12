@@ -51,6 +51,8 @@ export function parseOpenCodeJsonl(stdout: string) {
 
     if (type === "step_finish") {
       const part = parseObject(event.part);
+      const text = asString(part.message, "").trim();
+      if (text) messages.push(text);
       const tokens = parseObject(part.tokens);
       const cache = parseObject(tokens.cache);
       usage.inputTokens += asNumber(tokens.input, 0);

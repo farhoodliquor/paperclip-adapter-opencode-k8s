@@ -31,6 +31,19 @@ describe("parseOpenCodeJsonl", () => {
     expect(result.costUsd).toBeCloseTo(0.001);
   });
 
+  it("captures text from step_finish message field", () => {
+    const stdout = [
+      JSON.stringify({
+        type: "step_finish",
+        part: { message: "Final response text", tokens: { input: 10, output: 5 } },
+      }),
+    ].join("\n");
+
+    const result = parseOpenCodeJsonl(stdout);
+
+    expect(result.summary).toBe("Final response text");
+  });
+
   it("captures errors from error type events", () => {
     const stdout = [
       JSON.stringify({ type: "error", error: { message: "Something went wrong" } }),
