@@ -56,7 +56,7 @@ containers:
         mountPath: /paperclip
 ```
 
-> **Note:** Your cluster must have a StorageClass that supports RWX volumes. Common options include AWS EFS, Azure Files, NFS-based provisioners, or GCP Filestore. Standard block storage (gp3, Azure Disk, GCE PD) does **not** support RWX.
+> **Note:** Your cluster must have a StorageClass that supports RWX volumes. Common options include Longhorn, Rook Ceph, AWS EFS, Azure Files, NFS-based provisioners, or GCP Filestore. Standard block storage (gp3, Azure Disk, GCE PD) does **not** support RWX.
 
 ### 2. Kubernetes RBAC
 
