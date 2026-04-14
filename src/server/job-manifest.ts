@@ -8,39 +8,10 @@ import {
   parseObject,
   buildPaperclipEnv,
   renderTemplate,
+  joinPromptSections,
+  stringifyPaperclipWakePayload,
+  renderPaperclipWakePrompt,
 } from "@paperclipai/adapter-utils/server-utils";
-
-function joinPromptSections(sections: string[], separator = "\n\n"): string {
-  return sections.filter((s) => s.trim().length > 0).join(separator);
-}
-
-function stringifyPaperclipWakePayload(wake: unknown): string | null {
-  if (!wake || typeof wake !== "object") return null;
-  try {
-    const json = JSON.stringify(wake);
-    return json === "{}" ? null : json;
-  } catch {
-    return null;
-  }
-}
-
-function renderPaperclipWakePrompt(wake: unknown, _opts?: { resumedSession?: boolean }): string {
-  if (!wake || typeof wake !== "object") return "";
-  const w = wake as Record<string, unknown>;
-  const reason = typeof w.reason === "string" ? w.reason.trim() : "";
-  const comments = Array.isArray(w.comments) ? w.comments : [];
-  if (!reason && comments.length === 0) return "";
-  const parts: string[] = [];
-  if (reason) parts.push(`Wake reason: ${reason}`);
-  for (const c of comments) {
-    if (typeof c === "object" && c !== null) {
-      const comment = c as Record<string, unknown>;
-      const body = typeof comment.body === "string" ? comment.body.trim() : "";
-      if (body) parts.push(`Comment: ${body}`);
-    }
-  }
-  return parts.join("\n\n");
-}
 import type { SelfPodInfo } from "./k8s-client.js";
 
 export interface JobBuildInput {

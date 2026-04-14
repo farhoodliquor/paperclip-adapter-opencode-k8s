@@ -1,12 +1,6 @@
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import { inferOpenAiCompatibleBiller, redactHomePathUserSegments } from "@paperclipai/adapter-utils";
 import { asString, asNumber, asBoolean, parseObject } from "@paperclipai/adapter-utils/server-utils";
-
-function inferOpenAiCompatibleBiller(env: Record<string, string>, _fallback: string | null): string | null {
-  if (env.OPENROUTER_API_KEY) return "openrouter";
-  if (env.OPENAI_BASE_URL?.includes("openrouter")) return "openrouter";
-  if (env.OPENAI_API_KEY) return "openai";
-  return null;
-}
 import {
   parseOpenCodeJsonl,
   isOpenCodeUnknownSessionError,
@@ -137,7 +131,7 @@ async function streamPodLogs(
 
   const writable = new Writable({
     write(chunk: Buffer, _encoding, callback) {
-      const text = chunk.toString("utf-8");
+      const text = redactHomePathUserSegments(chunk.toString("utf-8"));
       chunks.push(text);
       void onLog("stdout", text).then(() => callback(), callback);
     },
@@ -398,13 +392,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     : null;
 
   const provider = parseModelProvider(model);
-  // Build a minimal env record for biller inference
-  const billerEnv: Record<string, string> = {};
-  for (const key of ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENROUTER_API_KEY"]) {
-    const val = process.env[key];
-    if (val) billerEnv[key] = val;
-  }
-  const biller = inferOpenAiCompatibleBiller(billerEnv, null) ?? provider ?? "unknown";
+  const biller = inferOpenAiCompatibleBiller(process.env, null) ?? provider ?? "unknown";
 
   const parsedError = typeof parsed.errorMessage === "string" ? parsed.errorMessage.trim() : "";
   const rawExitCode = exitCode;

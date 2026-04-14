@@ -1,4 +1,5 @@
 import type { ServerAdapterModule } from "@paperclipai/adapter-utils";
+import { getAdapterSessionManagement } from "@paperclipai/adapter-utils";
 import { type, models, agentConfigurationDoc } from "../index.js";
 import { execute } from "./execute.js";
 import { testEnvironment } from "./test.js";
@@ -15,6 +16,16 @@ export function createServerAdapter(): ServerAdapterModule {
     supportsLocalAgentJwt: true,
     agentConfigurationDoc,
     getConfigSchema,
+    sessionManagement: getAdapterSessionManagement("opencode_local") ?? {
+      supportsSessionResume: true,
+      nativeContextManagement: "unknown",
+      defaultSessionCompaction: {
+        enabled: true,
+        maxSessionRuns: 20,
+        maxRawInputTokens: 500_000,
+        maxSessionAgeHours: 24,
+      },
+    },
   };
 }
 
