@@ -5,6 +5,7 @@ import { execute } from "./execute.js";
 import { testEnvironment } from "./test.js";
 import { sessionCodec } from "./session.js";
 import { getConfigSchema } from "./config-schema.js";
+import { listOpenCodeSkills, syncOpenCodeSkills } from "./skills.js";
 
 export function createServerAdapter(): ServerAdapterModule {
   return {
@@ -13,6 +14,8 @@ export function createServerAdapter(): ServerAdapterModule {
     testEnvironment,
     sessionCodec,
     models,
+    listSkills: listOpenCodeSkills,
+    syncSkills: syncOpenCodeSkills,
     supportsLocalAgentJwt: true,
     agentConfigurationDoc,
     getConfigSchema,
