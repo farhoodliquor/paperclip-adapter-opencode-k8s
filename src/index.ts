@@ -26,6 +26,7 @@ Core fields:
 - model (string, required): OpenCode model id in provider/model format (e.g. anthropic/claude-sonnet-4-6)
 - variant (string, optional): provider-specific reasoning/profile variant passed as --variant
 - dangerouslySkipPermissions (boolean, optional): inject runtime config with permission.external_directory=allow; defaults to true
+- instructionsFilePath (string, optional): absolute path to a markdown instructions file (e.g. AGENTS.md on the PVC); content is prepended to every run prompt as system instructions
 - promptTemplate (string, optional): run prompt template
 - extraArgs (string[], optional): additional CLI args appended to the opencode command
 - env (object, optional): KEY=VALUE environment variables; overrides inherited vars from the Deployment
@@ -54,7 +55,9 @@ Inherited from Deployment (no config needed):
 
 Notes:
 - Session resume works via the shared /paperclip PVC (HOME=/paperclip)
-- Skills are bundled in the container image
+- Skills configured in Paperclip have their markdown content read from the PVC and prepended to each run prompt
+- Desired skills are resolved from config (paperclipSkills / paperclipRuntimeSkills) at execute time
+- instructionsFilePath content is prepended before skill content, then before the task prompt
 - Prompts are delivered via a busybox init container writing to an emptyDir volume
 - Runtime config (permission.external_directory=allow) is written inside the Job container
 - OPENCODE_DISABLE_PROJECT_CONFIG=true is always set to prevent config file pollution

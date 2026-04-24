@@ -20,8 +20,8 @@ export function createServerAdapter(): ServerAdapterModule {
     supportsLocalAgentJwt: true,
     agentConfigurationDoc,
     getConfigSchema,
-    supportsInstructionsBundle: false,
-    instructionsPathKey: undefined,
+    supportsInstructionsBundle: true,
+    instructionsPathKey: "instructionsFilePath",
     requiresMaterializedRuntimeSkills: false,
     sessionManagement: getAdapterSessionManagement("opencode_local") ?? {
       supportsSessionResume: true,

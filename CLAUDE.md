@@ -25,16 +25,26 @@ This is a Paperclip adapter plugin that runs OpenCode agents as isolated Kuberne
 
 1. **Concurrency guard** — checks for existing running Jobs for the same agent (shared PVC/session enforcement)
 2. **Self-pod introspection** (`getSelfPodInfo`) — queries own pod to inherit image, imagePullSecrets, DNS config, PVC mount, and all env vars from the Deployment
-3. **Job manifest build** (`buildJobManifest`) — constructs a K8s Job with:
+3. **Instructions + skill bundle resolution** — reads `instructionsFilePath` from config and desired skill markdown files from the PVC; content is prepended to the prompt at build time
+4. **Job manifest build** (`buildJobManifest`) — constructs a K8s Job with:
    - Init container (busybox) that writes the prompt to an emptyDir volume
    - Main opencode container that pipes the prompt via stdin
+   - Prompt assembled as: `[instructionsContent] + [skillsBundleContent] + bootstrapPrompt + wakePrompt + sessionHandoff + heartbeatPrompt`
    - Inherited env vars layered: Deployment env → PAPERCLIP_* vars → user overrides
    - Resource requests/limits, security contexts, tolerations, nodeSelector applied from config
-4. **Job creation** — creates the Job in the target namespace
-5. **Pod scheduling wait** — polls for the pod to be scheduled, checking init container states and image pull issues
-6. **Log streaming + completion wait** — streams pod logs to the Paperclip UI while waiting for Job completion (with configurable timeout)
-7. **JSONL parsing** (`parseOpenCodeJsonl`) — extracts session ID, usage tokens, cost, summary, and errors from OpenCode JSONL output
-8. **Result synthesis** — returns exit code, usage metrics, session params for resume, and billing type inference
+5. **Job creation** — creates the Job in the target namespace
+6. **Pod scheduling wait** — polls for the pod to be scheduled, checking init container states and image pull issues
+7. **Log streaming + completion wait** — streams pod logs to the Paperclip UI while waiting for Job completion (with configurable timeout)
+8. **JSONL parsing** (`parseOpenCodeJsonl`) — extracts session ID, usage tokens, cost, summary, and errors from OpenCode JSONL output
+9. **Result synthesis** — returns exit code, usage metrics, session params for resume, and billing type inference
+
+### Skill Materialization (`src/server/skills.ts` + `src/server/execute.ts`)
+
+Skills operate in **ephemeral** mode: no symlinks are written to PVC. Instead, `execute()` reads the markdown content of each desired skill at run time using `readPaperclipRuntimeSkillEntries` + `entry.source`, concatenates them (separated by `---`), and passes the bundle to `buildJobManifest` as `skillsBundleContent`. The content is prepended to the prompt so OpenCode receives it as system context.
+
+### `instructionsFilePath` Config Field
+
+Set `instructionsFilePath` to an absolute path (typically on the PVC, e.g. `/paperclip/.claude/projects/COMPANY/agents/AGENT/AGENTS.md`). The file is read by the adapter server before Job creation and its content prepended to every run prompt. `supportsInstructionsBundle: true` enables the Paperclip UI bundle editor for this field.
 
 ### Key State: SelfPodInfo (`src/server/k8s-client.ts`)
 
