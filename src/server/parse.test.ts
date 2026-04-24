@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseOpenCodeJsonl, isOpenCodeUnknownSessionError } from "./parse.js";
+import { parseOpenCodeJsonl, isOpenCodeUnknownSessionError, isOpenCodeStepLimitResult } from "./parse.js";
 
 describe("parseOpenCodeJsonl", () => {
   it("parses text messages", () => {
@@ -116,6 +116,37 @@ describe("parseOpenCodeJsonl", () => {
     const result = parseOpenCodeJsonl(stdout);
 
     expect(result.errorMessage).toBe("Nested error");
+  });
+});
+
+describe("isOpenCodeStepLimitResult", () => {
+  it("returns true for step_finish with reason max_turns", () => {
+    const stdout = JSON.stringify({ type: "step_finish", part: { reason: "max_turns", tokens: {} } });
+    expect(isOpenCodeStepLimitResult(stdout)).toBe(true);
+  });
+
+  it("returns true for step_finish with reason max_steps", () => {
+    const stdout = JSON.stringify({ type: "step_finish", part: { reason: "max_steps", tokens: {} } });
+    expect(isOpenCodeStepLimitResult(stdout)).toBe(true);
+  });
+
+  it("returns true for step_finish with reason step_limit", () => {
+    const stdout = JSON.stringify({ type: "step_finish", part: { reason: "step_limit", tokens: {} } });
+    expect(isOpenCodeStepLimitResult(stdout)).toBe(true);
+  });
+
+  it("returns false for step_finish with reason end_turn", () => {
+    const stdout = JSON.stringify({ type: "step_finish", part: { reason: "end_turn", tokens: {} } });
+    expect(isOpenCodeStepLimitResult(stdout)).toBe(false);
+  });
+
+  it("returns false with no step_finish events", () => {
+    const stdout = JSON.stringify({ type: "text", part: { text: "Hello" } });
+    expect(isOpenCodeStepLimitResult(stdout)).toBe(false);
+  });
+
+  it("returns false for empty stdout", () => {
+    expect(isOpenCodeStepLimitResult("")).toBe(false);
   });
 });
 

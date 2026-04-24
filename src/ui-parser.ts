@@ -9,6 +9,7 @@
 
 type TranscriptEntry =
   | { kind: "assistant"; ts: string; text: string; delta?: boolean }
+  | { kind: "thinking"; ts: string; text: string }
   | { kind: "tool_call"; ts: string; name: string; input: unknown; toolUseId?: string }
   | { kind: "tool_result"; ts: string; toolUseId: string; toolName?: string; content: string; isError: boolean }
   | { kind: "result"; ts: string; text: string; inputTokens: number; outputTokens: number; cachedTokens: number; costUsd: number; subtype: string; isError: boolean; errors: string[] }
@@ -155,7 +156,14 @@ export function parseStdoutLine(line: string, ts: string): TranscriptEntry[] {
     return [{ kind: "system", ts, text: "Starting step…" }];
   }
 
-  // Assistant message (nested content blocks)
+  // Standalone thinking event (extended reasoning)
+  if (type === "thinking") {
+    const text = asString(part.thinking ?? part.text, "").trim();
+    if (text) return [{ kind: "thinking", ts, text }];
+    return [];
+  }
+
+  // Assistant message (nested content blocks — text and thinking)
   if (type === "assistant") {
     const content = part.message ?? part;
     const contentRecord = asRecord(content);
@@ -163,13 +171,57 @@ export function parseStdoutLine(line: string, ts: string): TranscriptEntry[] {
       const contentArr = Array.isArray(contentRecord.content)
         ? contentRecord.content
         : [contentRecord.content];
+      const entries: TranscriptEntry[] = [];
       for (const item of contentArr) {
         const itemRecord = asRecord(item);
         if (itemRecord.type === "text" && typeof itemRecord.text === "string") {
           const text = (itemRecord.text as string).trim();
-          if (text) return [{ kind: "assistant", ts, text }];
+          if (text) entries.push({ kind: "assistant", ts, text });
+        } else if (itemRecord.type === "thinking" && typeof itemRecord.thinking === "string") {
+          const text = (itemRecord.thinking as string).trim();
+          if (text) entries.push({ kind: "thinking", ts, text });
         }
       }
+      return entries;
+    }
+    return [];
+  }
+
+  // User turn — surface tool_result blocks so they appear in the transcript
+  if (type === "user") {
+    const content = part.message ?? part;
+    const contentRecord = asRecord(content);
+    if (contentRecord.content) {
+      const contentArr = Array.isArray(contentRecord.content)
+        ? contentRecord.content
+        : [contentRecord.content];
+      const entries: TranscriptEntry[] = [];
+      for (const item of contentArr) {
+        const itemRecord = asRecord(item);
+        if (itemRecord.type === "tool_result") {
+          const toolUseId = asString(itemRecord.tool_use_id ?? itemRecord.toolUseId ?? "", "");
+          const contentVal = itemRecord.content;
+          let resultText = "";
+          if (typeof contentVal === "string") {
+            resultText = contentVal.trim();
+          } else if (Array.isArray(contentVal)) {
+            resultText = contentVal
+              .map((c) => asString(asRecord(c).text, ""))
+              .join("")
+              .trim();
+          }
+          if (toolUseId || resultText) {
+            entries.push({
+              kind: "tool_result",
+              ts,
+              toolUseId: toolUseId || "unknown",
+              content: resultText,
+              isError: false,
+            });
+          }
+        }
+      }
+      return entries;
     }
     return [];
   }

@@ -17,6 +17,10 @@ import type { SelfPodInfo } from "./k8s-client.js";
 export interface JobBuildInput {
   ctx: AdapterExecutionContext;
   selfPod: SelfPodInfo;
+  /** Content of the agent's instructions file (e.g. AGENTS.md), prepended to the prompt. */
+  instructionsContent?: string;
+  /** Concatenated content of desired skill markdown files, prepended after instructions. */
+  skillsBundleContent?: string;
 }
 
 export interface JobBuildResult {
@@ -26,6 +30,46 @@ export interface JobBuildResult {
   prompt: string;
   opencodeArgs: string[];
   promptMetrics: Record<string, number>;
+}
+
+/**
+ * Parse a config field that may be a JSON object, a plain object, or a textarea
+ * with "key=value" lines (one per line). Used for nodeSelector and labels.
+ */
+function parseKeyValueOrObject(value: unknown): Record<string, string> {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, v]) => typeof v === "string")
+        .map(([k, v]) => [k, v as string]),
+    );
+  }
+  if (typeof value !== "string") return {};
+  const text = value.trim();
+  if (!text) return {};
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return Object.fromEntries(
+        Object.entries(parsed as Record<string, unknown>)
+          .filter(([, v]) => typeof v === "string")
+          .map(([k, v]) => [k, v as string]),
+      );
+    }
+  } catch {
+    // fall through to key=value parsing
+  }
+  const result: Record<string, string> = {};
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx === -1) continue;
+    const key = trimmed.slice(0, eqIdx).trim();
+    const val = trimmed.slice(eqIdx + 1).trim();
+    if (key) result[key] = val;
+  }
+  return result;
 }
 
 function sanitizeForK8sName(value: string): string {
@@ -145,9 +189,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const timeoutSec = asNumber(config.timeoutSec, 0);
   const ttlSeconds = asNumber(config.ttlSecondsAfterFinished, 300);
   const resources = parseObject(config.resources);
-  const nodeSelector = parseObject(config.nodeSelector);
+  const nodeSelector = parseKeyValueOrObject(config.nodeSelector);
   const tolerations = Array.isArray(config.tolerations) ? config.tolerations : [];
-  const extraLabels = parseObject(config.labels);
+  const extraLabels = parseKeyValueOrObject(config.labels);
 
   // Resolve working directory
   const workspaceContext = parseObject(context.paperclipWorkspace);
@@ -185,7 +229,11 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const shouldUseResumeDeltaPrompt = Boolean(runtimeSessionId) && wakePrompt.length > 0;
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+  const instructionsContent = input.instructionsContent?.trim() ?? "";
+  const skillsBundleContent = input.skillsBundleContent?.trim() ?? "";
   const prompt = joinPromptSections([
+    instructionsContent,
+    skillsBundleContent,
     renderedBootstrapPrompt,
     wakePrompt,
     sessionHandoffNote,
@@ -193,6 +241,8 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   ]);
   const promptMetrics = {
     promptChars: prompt.length,
+    instructionsChars: instructionsContent.length,
+    skillsBundleChars: skillsBundleContent.length,
     bootstrapPromptChars: renderedBootstrapPrompt.length,
     wakePromptChars: wakePrompt.length,
     sessionHandoffChars: sessionHandoffNote.length,

@@ -110,4 +110,38 @@ describe("buildJobManifest", () => {
 
     expect(result.job.spec?.template?.spec?.restartPolicy).toBe("Never");
   });
+
+  it("applies nodeSelector from key=value textarea string", () => {
+    const ctx = { ...mockCtx, config: { nodeSelector: "kubernetes.io/arch=amd64\nkubernetes.io/os=linux" } };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+
+    expect(result.job.spec?.template?.spec?.nodeSelector).toEqual({
+      "kubernetes.io/arch": "amd64",
+      "kubernetes.io/os": "linux",
+    });
+  });
+
+  it("applies nodeSelector from JSON object string", () => {
+    const ctx = { ...mockCtx, config: { nodeSelector: '{"node-type":"gpu"}' } };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+
+    expect(result.job.spec?.template?.spec?.nodeSelector).toEqual({ "node-type": "gpu" });
+  });
+
+  it("applies nodeSelector from plain object config", () => {
+    const ctx = { ...mockCtx, config: { nodeSelector: { "zone": "us-east-1" } } };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+
+    expect(result.job.spec?.template?.spec?.nodeSelector).toEqual({ zone: "us-east-1" });
+  });
+
+  it("ignores blank lines and comments in nodeSelector textarea", () => {
+    const ctx = {
+      ...mockCtx,
+      config: { nodeSelector: "# comment\n\nkubernetes.io/arch=amd64\n" },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+
+    expect(result.job.spec?.template?.spec?.nodeSelector).toEqual({ "kubernetes.io/arch": "amd64" });
+  });
 });

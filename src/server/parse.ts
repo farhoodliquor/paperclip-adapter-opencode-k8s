@@ -88,6 +88,23 @@ export function parseOpenCodeJsonl(stdout: string) {
   };
 }
 
+export function isOpenCodeStepLimitResult(stdout: string): boolean {
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const event = parseJson(line);
+    if (!event) continue;
+    if (asString(event.type, "") === "step_finish") {
+      const part = parseObject(event.part);
+      const reason = asString(part.reason, "").toLowerCase();
+      if (reason === "max_turns" || reason === "max_steps" || reason === "step_limit") {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 export function isOpenCodeUnknownSessionError(stdout: string, stderr: string): boolean {
   const haystack = `${stdout}\n${stderr}`
     .split(/\r?\n/)
