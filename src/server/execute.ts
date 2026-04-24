@@ -13,6 +13,16 @@ import type * as k8s from "@kubernetes/client-node";
 import { Writable } from "node:stream";
 
 const POLL_INTERVAL_MS = 2000;
+const LOG_EXIT_COMPLETION_GRACE_MS = parseInt(process.env.LOG_EXIT_COMPLETION_GRACE_MS ?? "30000", 10);
+
+export function isK8s404(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const asAny = err as unknown as Record<string, unknown>;
+  if (typeof asAny.statusCode === "number" && asAny.statusCode === 404) return true;
+  const resp = asAny.response as Record<string, unknown> | undefined;
+  if (typeof resp?.statusCode === "number" && resp.statusCode === 404) return true;
+  return false;
+}
 
 function parseModelProvider(model: string | null): string | null {
   if (!model) return null;
@@ -191,45 +201,74 @@ async function readPodLogs(
   }
 }
 
+type JobCompletionResult = { succeeded: boolean; timedOut: boolean; jobGone: boolean };
+
 async function waitForJobCompletion(
   namespace: string,
   jobName: string,
   timeoutMs: number,
   kubeconfigPath?: string,
-): Promise<{ succeeded: boolean; timedOut: boolean }> {
+): Promise<JobCompletionResult> {
   const batchApi = getBatchApi(kubeconfigPath);
   const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : 0;
 
   while (deadline === 0 || Date.now() < deadline) {
-    const job = await batchApi.readNamespacedJob({ name: jobName, namespace });
+    let job: Awaited<ReturnType<typeof batchApi.readNamespacedJob>>;
+    try {
+      job = await batchApi.readNamespacedJob({ name: jobName, namespace });
+    } catch (err) {
+      if (isK8s404(err)) return { succeeded: false, timedOut: false, jobGone: true };
+      throw err;
+    }
     const conditions = job.status?.conditions ?? [];
 
     const complete = conditions.find((c) => c.type === "Complete" && c.status === "True");
-    if (complete) return { succeeded: true, timedOut: false };
+    if (complete) return { succeeded: true, timedOut: false, jobGone: false };
 
     const failed = conditions.find((c) => c.type === "Failed" && c.status === "True");
     if (failed) {
       const isDeadlineExceeded = failed.reason === "DeadlineExceeded";
-      return { succeeded: false, timedOut: isDeadlineExceeded };
+      return { succeeded: false, timedOut: isDeadlineExceeded, jobGone: false };
     }
 
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
   }
 
-  return { succeeded: false, timedOut: true };
+  return { succeeded: false, timedOut: true, jobGone: false };
 }
 
-async function getPodExitCode(namespace: string, jobName: string, kubeconfigPath?: string): Promise<number | null> {
+export async function completionWithGrace(
+  completionPromise: Promise<JobCompletionResult>,
+  graceMs: number,
+): Promise<JobCompletionResult> {
+  const graceExpired = new Promise<JobCompletionResult>(
+    (resolve) => setTimeout(() => resolve({ succeeded: false, timedOut: true, jobGone: false }), graceMs),
+  );
+  try {
+    return await Promise.race([completionPromise, graceExpired]);
+  } catch {
+    return { succeeded: false, timedOut: true, jobGone: false };
+  }
+}
+
+async function getPodTerminatedInfo(
+  namespace: string,
+  jobName: string,
+  kubeconfigPath?: string,
+): Promise<{ exitCode: number | null; reason: string | null }> {
   const coreApi = getCoreApi(kubeconfigPath);
   const podList = await coreApi.listNamespacedPod({
     namespace,
     labelSelector: `job-name=${jobName}`,
   });
   const pod = podList.items[0];
-  if (!pod) return null;
-
+  if (!pod) return { exitCode: null, reason: null };
   const containerStatus = pod.status?.containerStatuses?.find((s) => s.name === "opencode");
-  return containerStatus?.state?.terminated?.exitCode ?? null;
+  const terminated = containerStatus?.state?.terminated;
+  return {
+    exitCode: terminated?.exitCode ?? null,
+    reason: terminated?.reason ?? terminated?.message ?? null,
+  };
 }
 
 async function cleanupJob(
@@ -366,6 +405,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let stdout = "";
   let exitCode: number | null = null;
   let jobTimedOut = false;
+  let podTerminatedReason: string | null = null;
 
   try {
     const scheduleTimeoutMs = 120_000;
@@ -387,14 +427,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const completionTimeoutMs = timeoutSec > 0 ? (timeoutSec + graceSec) * 1000 : 0;
 
-    const [logResult, completionResult] = await Promise.allSettled([
-      streamPodLogs(namespace, podName, onLog, kubeconfigPath),
-      waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath),
-    ]);
+    // Start completion poller in parallel with log streaming
+    const completionPromise = waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath);
 
-    if (logResult.status === "fulfilled") {
-      stdout = logResult.value;
-    }
+    stdout = await streamPodLogs(namespace, podName, onLog, kubeconfigPath);
 
     if (!stdout.trim()) {
       await onLog("stdout", `[paperclip] Log stream returned empty — reading pod logs directly...\n`);
@@ -402,15 +438,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (stdout.trim()) {
         await onLog("stdout", stdout);
       }
+    } else if (!parseOpenCodeJsonl(stdout).sessionId) {
+      // Stdout is non-empty but missing a valid session result — try one-shot fallback
+      await onLog("stdout", `[paperclip] Partial stdout missing session result — reading pod logs directly...\n`);
+      const fallbackLogs = await readPodLogs(namespace, podName, kubeconfigPath);
+      if (fallbackLogs.trim()) {
+        stdout = fallbackLogs;
+        await onLog("stdout", fallbackLogs);
+      }
     }
 
-    if (completionResult.status === "fulfilled") {
-      jobTimedOut = completionResult.value.timedOut;
-    } else {
-      jobTimedOut = true;
+    // After log stream exits, wait at most LOG_EXIT_COMPLETION_GRACE_MS for the job
+    // condition to settle — avoids racing TTL cleanup vs condition update lag
+    const completion = await completionWithGrace(completionPromise, LOG_EXIT_COMPLETION_GRACE_MS);
+    jobTimedOut = completion.timedOut;
+
+    if (completion.jobGone) {
+      await onLog("stdout", `[paperclip] Job ${jobName} not found (likely TTL-cleaned after completion).\n`);
     }
 
-    exitCode = await getPodExitCode(namespace, jobName, kubeconfigPath);
+    const terminatedInfo = await getPodTerminatedInfo(namespace, jobName, kubeconfigPath);
+    exitCode = terminatedInfo.exitCode;
+    podTerminatedReason = terminatedInfo.reason;
   } finally {
     if (!retainJobs) {
       await cleanupJob(namespace, jobName, onLog, kubeconfigPath);
@@ -480,8 +529,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     await onLog("stdout", `[paperclip] OpenCode step limit reached; clearing session for next run.\n`);
   }
 
+  // Detect empty LLM response: session started but LLM returned no tokens or messages
+  const hasLlmOutput = parsed.usage.outputTokens > 0 || !!parsed.summary;
+  if (!jobTimedOut && parsed.sessionId !== null && !hasLlmOutput && !parsedError) {
+    await onLog("stderr", `[paperclip] LLM returned empty response (0 output tokens).\n`);
+    return {
+      exitCode: synthesizedExitCode ?? 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: "LLM API returned empty response",
+      errorCode: "llm_api_error",
+      sessionId: resolvedSessionId,
+      sessionParams: resolvedSessionParams,
+      resultJson: { stdout },
+    };
+  }
+
   const firstStderrLine = stdout.split(/\r?\n/).map((l) => l.trim()).find(Boolean) ?? "";
-  const fallbackErrorMessage = parsedError || firstStderrLine || `OpenCode exited with code ${synthesizedExitCode ?? -1}`;
+  const podFailureDescription = podTerminatedReason
+    ? `Pod exited: ${podTerminatedReason}${synthesizedExitCode != null ? ` (exit ${synthesizedExitCode})` : ""}`
+    : null;
+  const fallbackErrorMessage =
+    parsedError || podFailureDescription || firstStderrLine || `OpenCode exited with code ${synthesizedExitCode ?? -1}`;
 
   return {
     exitCode: synthesizedExitCode,
