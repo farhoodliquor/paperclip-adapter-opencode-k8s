@@ -10,7 +10,8 @@
   "exports": {
     ".": "./dist/index.js",
     "./server": "./dist/server/index.js",
-    "./ui-parser": "./dist/ui-parser.js"
+    "./ui-parser": "./dist/ui-parser.js",
+    "./cli": "./dist/cli/index.js"
   },
   "files": [
     "dist"
@@ -23,10 +24,11 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@kubernetes/client-node": "^1.0.0"
+    "@kubernetes/client-node": "^1.0.0",
+    "picocolors": "^1.1.1"
   },
   "peerDependencies": {
-    "@paperclipai/adapter-utils": "2026.415.0-canary.7"
+    "@paperclipai/adapter-utils": ">=2026.415.0-canary.7"
   },
   "devDependencies": {
     "@paperclipai/adapter-utils": "2026.415.0-canary.7",

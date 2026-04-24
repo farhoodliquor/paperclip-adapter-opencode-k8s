@@ -1,8 +1,6 @@
 export const type = "opencode_k8s";
 export const label = "OpenCode (Kubernetes)";
 
-export const models: undefined = undefined;
-
 import type { CLIAdapterModule } from "@paperclipai/adapter-utils";
 import { formatEvent } from "./cli/format-event.js";
 
