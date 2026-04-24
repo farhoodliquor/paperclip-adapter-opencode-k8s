@@ -133,7 +133,7 @@ export function formatEvent(line: string, debug: boolean): string {
     }
 
     case "error": {
-      const text = errorText(event).trim();
+      const text = errorText(event.error ?? event.message ?? event).trim();
       if (text) return `✗ ${text}`;
       return "";
     }

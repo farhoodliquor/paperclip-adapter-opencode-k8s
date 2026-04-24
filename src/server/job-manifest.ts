@@ -14,6 +14,8 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import type { SelfPodInfo } from "./k8s-client.js";
 
+export const LARGE_PROMPT_THRESHOLD_BYTES = 256 * 1024;
+
 export interface JobBuildInput {
   ctx: AdapterExecutionContext;
   selfPod: SelfPodInfo;
@@ -21,6 +23,12 @@ export interface JobBuildInput {
   instructionsContent?: string;
   /** Concatenated content of desired skill markdown files, prepended after instructions. */
   skillsBundleContent?: string;
+  /**
+   * When set, the prompt is stored in this K8s Secret (already created by the caller)
+   * and the init container mounts and copies it instead of using an env var.
+   * Required when the prompt exceeds LARGE_PROMPT_THRESHOLD_BYTES.
+   */
+  promptSecretName?: string;
 }
 
 export interface JobBuildResult {
@@ -157,11 +165,18 @@ function buildEnvVars(
   merged.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
   merged.HOME = "/paperclip";
 
-  // Convert to V1EnvVar array
+  // Convert literal-value vars to V1EnvVar array
   const envVars: k8s.V1EnvVar[] = Object.entries(merged).map(([name, value]) => ({
     name,
     value,
   }));
+
+  // Append valueFrom vars (Secret/ConfigMap-backed) only for names not already overridden
+  for (const envVar of selfPod.inheritedEnvValueFrom) {
+    if (!Object.prototype.hasOwnProperty.call(merged, envVar.name)) {
+      envVars.push({ name: envVar.name, valueFrom: envVar.valueFrom });
+    }
+  }
 
   return envVars;
 }
@@ -293,6 +308,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const volumes: k8s.V1Volume[] = [{ name: "prompt", emptyDir: {} }];
   const volumeMounts: k8s.V1VolumeMount[] = [{ name: "prompt", mountPath: "/tmp/prompt" }];
 
+  if (input.promptSecretName) {
+    volumes.push({ name: "prompt-secret", secret: { secretName: input.promptSecretName } });
+  }
+
   if (selfPod.pvcClaimName) {
     volumes.push({
       name: "data",
@@ -370,9 +389,19 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
               name: "write-prompt",
               image: "busybox:1.36",
               imagePullPolicy: "IfNotPresent",
-              command: ["sh", "-c", "echo \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt"],
-              env: [{ name: "PROMPT_CONTENT", value: prompt }],
-              volumeMounts: [{ name: "prompt", mountPath: "/tmp/prompt" }],
+              ...(input.promptSecretName
+                ? {
+                    command: ["sh", "-c", "cp /tmp/prompt-secret/prompt /tmp/prompt/prompt.txt"],
+                    volumeMounts: [
+                      { name: "prompt", mountPath: "/tmp/prompt" },
+                      { name: "prompt-secret", mountPath: "/tmp/prompt-secret", readOnly: true },
+                    ],
+                  }
+                : {
+                    command: ["sh", "-c", "printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt"],
+                    env: [{ name: "PROMPT_CONTENT", value: prompt }],
+                    volumeMounts: [{ name: "prompt", mountPath: "/tmp/prompt" }],
+                  }),
               securityContext,
               resources: {
                 requests: { cpu: "10m", memory: "16Mi" },
@@ -388,6 +417,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
               workingDir,
               command: ["sh", "-c", mainCommand],
               env: envVars,
+              ...(selfPod.inheritedEnvFrom.length > 0 ? { envFrom: selfPod.inheritedEnvFrom } : {}),
               volumeMounts,
               securityContext,
               resources: containerResources,

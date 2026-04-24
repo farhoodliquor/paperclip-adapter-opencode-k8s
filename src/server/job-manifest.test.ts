@@ -6,6 +6,8 @@ const mockSelfPod: JobBuildInput["selfPod"] = {
   image: "paperclip/paperclip:latest",
   imagePullSecrets: [],
   inheritedEnv: {},
+  inheritedEnvValueFrom: [],
+  inheritedEnvFrom: [],
   pvcClaimName: null,
   dnsConfig: undefined,
   secretVolumes: [],
@@ -143,5 +145,54 @@ describe("buildJobManifest", () => {
     const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
 
     expect(result.job.spec?.template?.spec?.nodeSelector).toEqual({ "kubernetes.io/arch": "amd64" });
+  });
+
+  it("forwards inheritedEnvValueFrom entries onto the opencode container env", () => {
+    const selfPod = {
+      ...mockSelfPod,
+      inheritedEnvValueFrom: [
+        { name: "MY_SECRET", valueFrom: { secretKeyRef: { name: "my-secret", key: "token" } } },
+      ],
+    };
+    const result = buildJobManifest({ ctx: mockCtx, selfPod });
+
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    const secretEnv = env.find((e) => e.name === "MY_SECRET");
+    expect(secretEnv?.valueFrom?.secretKeyRef?.name).toBe("my-secret");
+    expect(secretEnv?.valueFrom?.secretKeyRef?.key).toBe("token");
+  });
+
+  it("does not duplicate an inheritedEnvValueFrom entry if the name is already set as a literal", () => {
+    const selfPod = {
+      ...mockSelfPod,
+      inheritedEnv: { HOME: "/custom" },
+      inheritedEnvValueFrom: [
+        { name: "HOME", valueFrom: { secretKeyRef: { name: "s", key: "k" } } },
+      ],
+    };
+    const result = buildJobManifest({ ctx: mockCtx, selfPod });
+
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    const homeEntries = env.filter((e) => e.name === "HOME");
+    // HOME is overridden by merged (HOME=/paperclip hardcoded last), so valueFrom must not appear
+    expect(homeEntries.every((e) => e.value !== undefined)).toBe(true);
+  });
+
+  it("forwards inheritedEnvFrom onto the opencode container envFrom", () => {
+    const selfPod = {
+      ...mockSelfPod,
+      inheritedEnvFrom: [{ secretRef: { name: "my-config-secret" } }],
+    };
+    const result = buildJobManifest({ ctx: mockCtx, selfPod });
+
+    const container = result.job.spec?.template?.spec?.containers?.[0];
+    expect(container?.envFrom).toEqual([{ secretRef: { name: "my-config-secret" } }]);
+  });
+
+  it("omits envFrom when inheritedEnvFrom is empty", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+
+    const container = result.job.spec?.template?.spec?.containers?.[0];
+    expect(container?.envFrom).toBeUndefined();
   });
 });

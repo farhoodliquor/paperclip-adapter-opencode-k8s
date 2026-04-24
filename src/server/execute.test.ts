@@ -23,6 +23,8 @@ const MOCK_SELF_POD = {
   pvcClaimName: null,
   secretVolumes: [],
   inheritedEnv: {},
+  inheritedEnvValueFrom: [],
+  inheritedEnvFrom: [],
 };
 
 const MOCK_JOB = {

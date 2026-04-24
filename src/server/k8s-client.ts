@@ -20,8 +20,12 @@ export interface SelfPodInfo {
   dnsConfig: k8s.V1PodDNSConfig | undefined;
   pvcClaimName: string | null;
   secretVolumes: SelfPodSecretVolume[];
-  /** Env vars read directly from the pod spec's container definition. */
+  /** Env vars with literal values from the container spec. */
   inheritedEnv: Record<string, string>;
+  /** Env vars backed by secretKeyRef/configMapKeyRef/fieldRef (valueFrom). */
+  inheritedEnvValueFrom: k8s.V1EnvVar[];
+  /** Whole-Secret/ConfigMap env sources (envFrom) from the container spec. */
+  inheritedEnvFrom: k8s.V1EnvFromSource[];
 }
 
 let cachedSelfPod: SelfPodInfo | null = null;
@@ -102,7 +106,8 @@ export async function getSelfPodInfo(kubeconfigPath?: string): Promise<SelfPodIn
     throw new Error(`claude_k8s: pod ${hostname} has no spec`);
   }
 
-  const mainContainer = spec.containers[0];
+  const mainContainer =
+    spec.containers.find((c) => c.name === "paperclip") ?? spec.containers[0];
   if (!mainContainer?.image) {
     throw new Error(`claude_k8s: pod ${hostname} has no container image`);
   }
@@ -131,13 +136,21 @@ export async function getSelfPodInfo(kubeconfigPath?: string): Promise<SelfPodIn
     }
   }
 
-  // Collect all env vars directly from the pod spec container definition.
-  // This gives the authoritative env the container was configured with in K8s —
-  // no static allowlist needed; any env var from the Deployment is forwarded.
+  // Collect env vars from the pod spec container definition.
+  // Literal-value vars go into inheritedEnv (forwarded as plain strings).
+  // valueFrom vars (secretKeyRef, configMapKeyRef, fieldRef) are kept as
+  // V1EnvVar objects so the Job pod can resolve them at runtime.
+  // envFrom entries (whole-Secret/ConfigMap mounts) are forwarded as-is.
   const inheritedEnv: Record<string, string> = {};
+  const inheritedEnvValueFrom: k8s.V1EnvVar[] = [];
   for (const envVar of mainContainer.env ?? []) {
-    if (envVar.value) inheritedEnv[envVar.name] = envVar.value;
+    if (envVar.value !== undefined) {
+      inheritedEnv[envVar.name] = envVar.value;
+    } else if (envVar.valueFrom) {
+      inheritedEnvValueFrom.push({ name: envVar.name, valueFrom: envVar.valueFrom });
+    }
   }
+  const inheritedEnvFrom: k8s.V1EnvFromSource[] = [...(mainContainer.envFrom ?? [])];
 
   cachedSelfPod = {
     namespace,
@@ -149,6 +162,8 @@ export async function getSelfPodInfo(kubeconfigPath?: string): Promise<SelfPodIn
     pvcClaimName,
     secretVolumes,
     inheritedEnv,
+    inheritedEnvValueFrom,
+    inheritedEnvFrom,
   };
 
   return cachedSelfPod;

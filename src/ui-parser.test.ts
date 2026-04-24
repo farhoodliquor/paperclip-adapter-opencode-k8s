@@ -146,4 +146,180 @@ describe("parseStdoutLine", () => {
     const line = JSON.stringify({ type: "thinking", part: { thinking: "  " } });
     expect(parseStdoutLine(line, TS)).toEqual([]);
   });
+
+  it("maps step_start to system kind", () => {
+    const line = JSON.stringify({ type: "step_start" });
+    expect(parseStdoutLine(line, TS)).toEqual([{ kind: "system", ts: TS, text: "Starting step…" }]);
+  });
+
+  it("maps tool_use pending status to tool_call kind", () => {
+    const line = JSON.stringify({
+      type: "tool_use",
+      part: { tool: "bash", id: "call_1", state: { status: "pending", description: "ls -la" } },
+    });
+    const entries = parseStdoutLine(line, TS);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].kind).toBe("tool_call");
+    const entry = entries[0] as { name: string; toolUseId: string; input: unknown };
+    expect(entry.name).toBe("bash");
+    expect(entry.toolUseId).toBe("call_1");
+    expect(entry.input).toBe("ls -la");
+  });
+
+  it("maps tool_use error status to tool_result with isError=true", () => {
+    const line = JSON.stringify({
+      type: "tool_use",
+      part: { tool: "bash", id: "call_2", state: { status: "error", error: "Command not found" } },
+    });
+    const entries = parseStdoutLine(line, TS);
+    expect(entries).toHaveLength(1);
+    const entry = entries[0] as { kind: string; isError: boolean; content: string; toolName: string };
+    expect(entry.kind).toBe("tool_result");
+    expect(entry.isError).toBe(true);
+    expect(entry.content).toBe("Command not found");
+    expect(entry.toolName).toBe("bash");
+  });
+
+  it("uses 'Tool error' fallback when tool_use error field is empty", () => {
+    const line = JSON.stringify({
+      type: "tool_use",
+      part: { tool: "bash", state: { status: "error", error: "" } },
+    });
+    const entry = parseStdoutLine(line, TS)[0] as { content: string };
+    expect(entry.content).toBe("Tool error");
+  });
+
+  it("maps tool_use done status to tool_result", () => {
+    const line = JSON.stringify({
+      type: "tool_use",
+      part: { tool: "grep", id: "call_3", state: { status: "done", output: "3 matches" } },
+    });
+    const entries = parseStdoutLine(line, TS);
+    const entry = entries[0] as { kind: string; isError: boolean; content: string };
+    expect(entry.kind).toBe("tool_result");
+    expect(entry.isError).toBe(false);
+    expect(entry.content).toBe("3 matches");
+  });
+
+  it("uses description as content fallback when tool_use output is empty", () => {
+    const line = JSON.stringify({
+      type: "tool_use",
+      part: { tool: "ls", state: { status: "completed", output: "", description: "Listed 5 files" } },
+    });
+    const entry = parseStdoutLine(line, TS)[0] as { content: string };
+    expect(entry.content).toBe("Listed 5 files");
+  });
+
+  it("uses 'Done' when tool_use output and description are both empty", () => {
+    const line = JSON.stringify({
+      type: "tool_use",
+      part: { tool: "ls", state: { status: "completed", output: "", description: "" } },
+    });
+    const entry = parseStdoutLine(line, TS)[0] as { content: string };
+    expect(entry.content).toBe("Done");
+  });
+
+  it("uses tool name as toolUseId when id field is absent", () => {
+    const line = JSON.stringify({
+      type: "tool_use",
+      part: { tool: "bash", state: { status: "pending" } },
+    });
+    const entry = parseStdoutLine(line, TS)[0] as { toolUseId: string };
+    expect(entry.toolUseId).toBe("bash");
+  });
+
+  it("sets tool_call input to undefined when description is empty", () => {
+    const line = JSON.stringify({
+      type: "tool_use",
+      part: { tool: "bash", state: { status: "pending", description: "" } },
+    });
+    const entry = parseStdoutLine(line, TS)[0] as { input: unknown };
+    expect(entry.input).toBeUndefined();
+  });
+
+  it("accumulates reasoning tokens into step_finish outputTokens", () => {
+    const line = JSON.stringify({
+      type: "step_finish",
+      part: { tokens: { input: 100, output: 50, reasoning: 20, cache: { read: 80 } }, cost: 0.005 },
+    });
+    const entry = parseStdoutLine(line, TS)[0] as {
+      inputTokens: number; outputTokens: number; cachedTokens: number; costUsd: number;
+    };
+    expect(entry.inputTokens).toBe(100);
+    expect(entry.outputTokens).toBe(70); // output(50) + reasoning(20)
+    expect(entry.cachedTokens).toBe(80);
+    expect(entry.costUsd).toBeCloseTo(0.005);
+  });
+
+  it("step_finish uses reason as fallback text when message is empty", () => {
+    const line = JSON.stringify({
+      type: "step_finish",
+      part: { reason: "end_turn", tokens: {} },
+    });
+    const entry = parseStdoutLine(line, TS)[0] as { text: string; subtype: string };
+    expect(entry.text).toBe("Step finished: end_turn");
+    expect(entry.subtype).toBe("end_turn");
+  });
+
+  it("step_finish uses 'done' subtype when reason is absent", () => {
+    const line = JSON.stringify({ type: "step_finish", part: { tokens: {} } });
+    const entry = parseStdoutLine(line, TS)[0] as { text: string; subtype: string };
+    expect(entry.text).toBe("Step finished: done");
+    expect(entry.subtype).toBe("step_finish");
+  });
+
+  it("step_finish defaults all numeric fields to 0 when tokens absent", () => {
+    const line = JSON.stringify({ type: "step_finish", part: {} });
+    const entry = parseStdoutLine(line, TS)[0] as {
+      inputTokens: number; outputTokens: number; cachedTokens: number; costUsd: number;
+    };
+    expect(entry.inputTokens).toBe(0);
+    expect(entry.outputTokens).toBe(0);
+    expect(entry.cachedTokens).toBe(0);
+    expect(entry.costUsd).toBe(0);
+  });
+
+  it("returns empty for assistant event with non-text content blocks", () => {
+    const line = JSON.stringify({
+      type: "assistant",
+      part: { message: { content: [{ type: "tool_use", input: {} }] } },
+    });
+    expect(parseStdoutLine(line, TS)).toEqual([]);
+  });
+
+  it("returns empty for assistant event with empty text block", () => {
+    const line = JSON.stringify({
+      type: "assistant",
+      part: { message: { content: [{ type: "text", text: "   " }] } },
+    });
+    expect(parseStdoutLine(line, TS)).toEqual([]);
+  });
+
+  it("extracts error message from nested error.data.message", () => {
+    const line = JSON.stringify({ type: "error", error: { data: { message: "Nested message" } } });
+    const entry = parseStdoutLine(line, TS)[0] as { text: string };
+    expect(entry.text).toBe("Nested message");
+  });
+
+  it("falls back to error.name when message absent", () => {
+    const line = JSON.stringify({ type: "error", error: { name: "NotFoundError" } });
+    const entry = parseStdoutLine(line, TS)[0] as { text: string };
+    expect(entry.text).toBe("NotFoundError");
+  });
+
+  it("falls back to error.code when name absent", () => {
+    const line = JSON.stringify({ type: "error", error: { code: "ERR_CONN" } });
+    const entry = parseStdoutLine(line, TS)[0] as { text: string };
+    expect(entry.text).toBe("ERR_CONN");
+  });
+
+  it("returns empty array for unrecognized event types", () => {
+    const line = JSON.stringify({ type: "some_unknown_type", data: {} });
+    expect(parseStdoutLine(line, TS)).toEqual([]);
+  });
+
+  it("returns empty array for JSON with no type field", () => {
+    const line = JSON.stringify({ sessionID: "ses_123", data: "something" });
+    expect(parseStdoutLine(line, TS)).toEqual([]);
+  });
 });
