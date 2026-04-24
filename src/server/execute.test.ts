@@ -13,6 +13,7 @@ vi.mock("./k8s-client.js", () => ({
 
 vi.mock("./job-manifest.js", () => ({
   buildJobManifest: vi.fn(),
+  LARGE_PROMPT_THRESHOLD_BYTES: 256 * 1024,
 }));
 
 const MOCK_SELF_POD = {
@@ -68,7 +69,7 @@ function makeCtx(configOverrides: Record<string, unknown> = {}): AdapterExecutio
 function makeBatchApi(runningJobItems: unknown[] = []) {
   return {
     listNamespacedJob: vi.fn().mockResolvedValue({ items: runningJobItems }),
-    createNamespacedJob: vi.fn().mockResolvedValue({}),
+    createNamespacedJob: vi.fn().mockResolvedValue({ metadata: { uid: "test-job-uid" } }),
     readNamespacedJob: vi.fn().mockResolvedValue({
       status: { conditions: [{ type: "Complete", status: "True" }] },
     }),
@@ -111,6 +112,9 @@ function makeCoreApi(
       })
       .mockResolvedValueOnce(exitCodePod),
     readNamespacedPodLog: vi.fn().mockResolvedValue(jsonl),
+    createNamespacedSecret: vi.fn().mockResolvedValue({}),
+    deleteNamespacedSecret: vi.fn().mockResolvedValue({}),
+    patchNamespacedSecret: vi.fn().mockResolvedValue({}),
   };
 }
 
@@ -663,5 +667,129 @@ describe("execute — log dedup (waitForPod status dedup)", () => {
     // Pending status should appear exactly once even though listNamespacedPod was called twice
     const pendingMsgs = logMessages.filter((m) => m.includes("phase=Pending"));
     expect(pendingMsgs.length).toBe(1);
+  });
+});
+
+describe("execute — large-prompt Secret path", () => {
+  const LARGE_PROMPT = "x".repeat(300 * 1024); // 300 KiB > 256 KiB threshold
+
+  function mockLargePrompt() {
+    vi.mocked(buildJobManifest).mockReturnValue({
+      job: MOCK_JOB as ReturnType<typeof buildJobManifest>["job"],
+      jobName: JOB_NAME,
+      namespace: NAMESPACE,
+      prompt: LARGE_PROMPT,
+      opencodeArgs: [],
+      promptMetrics: null,
+    } as unknown as ReturnType<typeof buildJobManifest>);
+  }
+
+  it("calls buildJobManifest twice and passes promptSecretName on second call", async () => {
+    mockLargePrompt();
+
+    const ctx = makeCtx();
+    await execute(ctx);
+
+    expect(vi.mocked(buildJobManifest)).toHaveBeenCalledTimes(2);
+    const secondCall = vi.mocked(buildJobManifest).mock.calls[1][0];
+    expect(secondCall.promptSecretName).toBe(`${JOB_NAME}-prompt`);
+  });
+
+  it("creates a Secret with the prompt content before creating the Job", async () => {
+    mockLargePrompt();
+    const coreApi = makeCoreApi();
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+    const batchApi = makeBatchApi();
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const ctx = makeCtx();
+    await execute(ctx);
+
+    expect(coreApi.createNamespacedSecret).toHaveBeenCalledWith(
+      expect.objectContaining({
+        namespace: NAMESPACE,
+        body: expect.objectContaining({
+          metadata: expect.objectContaining({ name: `${JOB_NAME}-prompt` }),
+          stringData: expect.objectContaining({ prompt: LARGE_PROMPT }),
+        }),
+      }),
+    );
+    // Secret must be created before Job
+    const secretOrder = coreApi.createNamespacedSecret.mock.invocationCallOrder[0];
+    const jobOrder = batchApi.createNamespacedJob.mock.invocationCallOrder[0];
+    expect(secretOrder).toBeLessThan(jobOrder);
+  });
+
+  it("patches the Secret with a Job ownerReference after Job creation", async () => {
+    mockLargePrompt();
+    const batchApi = makeBatchApi();
+    batchApi.createNamespacedJob.mockResolvedValue({ metadata: { uid: "uid-abc-123" } });
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+    const coreApi = makeCoreApi();
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+
+    const ctx = makeCtx();
+    await execute(ctx);
+
+    expect(coreApi.patchNamespacedSecret).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: `${JOB_NAME}-prompt`,
+        namespace: NAMESPACE,
+        body: expect.objectContaining({
+          metadata: expect.objectContaining({
+            ownerReferences: [
+              expect.objectContaining({
+                kind: "Job",
+                name: JOB_NAME,
+                uid: "uid-abc-123",
+                controller: true,
+              }),
+            ],
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("cleans up the Secret in the finally block", async () => {
+    mockLargePrompt();
+    const coreApi = makeCoreApi();
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+
+    const ctx = makeCtx();
+    await execute(ctx);
+
+    expect(coreApi.deleteNamespacedSecret).toHaveBeenCalledWith(
+      expect.objectContaining({ name: `${JOB_NAME}-prompt`, namespace: NAMESPACE }),
+    );
+  });
+
+  it("cleans up the Secret when Job creation fails", async () => {
+    mockLargePrompt();
+    const batchApi = makeBatchApi();
+    batchApi.createNamespacedJob.mockRejectedValue(new Error("quota exceeded"));
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+    const coreApi = makeCoreApi();
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+
+    const ctx = makeCtx();
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+    expect(coreApi.deleteNamespacedSecret).toHaveBeenCalledWith(
+      expect.objectContaining({ name: `${JOB_NAME}-prompt` }),
+    );
+  });
+
+  it("does not create a Secret for prompts within threshold", async () => {
+    // Default beforeEach mock returns "Test prompt" (11 bytes < 256 KiB)
+    const coreApi = makeCoreApi();
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+
+    const ctx = makeCtx();
+    await execute(ctx);
+
+    expect(vi.mocked(buildJobManifest)).toHaveBeenCalledTimes(1);
+    expect(coreApi.createNamespacedSecret).not.toHaveBeenCalled();
   });
 });
