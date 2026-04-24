@@ -549,8 +549,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const podFailureDescription = podTerminatedReason
     ? `Pod exited: ${podTerminatedReason}${synthesizedExitCode != null ? ` (exit ${synthesizedExitCode})` : ""}`
     : null;
+  const errorParts = [parsedError, podFailureDescription].filter(Boolean);
   const fallbackErrorMessage =
-    parsedError || podFailureDescription || firstStderrLine || `OpenCode exited with code ${synthesizedExitCode ?? -1}`;
+    errorParts.join("; ") || firstStderrLine || `OpenCode exited with code ${synthesizedExitCode ?? -1}`;
 
   return {
     exitCode: synthesizedExitCode,
