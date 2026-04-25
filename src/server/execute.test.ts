@@ -357,7 +357,7 @@ describe("execute — SIGTERM handler", () => {
     if (capturedHandler) {
       const batchApi = vi.mocked(getBatchApi)();
       // Fire the handler and verify it deletes the job that was just created.
-      try { capturedHandler(); } catch { /* swallow process.exit throw */ }
+      try { (capturedHandler as () => void)(); } catch { /* swallow process.exit throw */ }
       await new Promise((r) => setTimeout(r, 50)); // let async handler tick
       expect(batchApi.deleteNamespacedJob).toHaveBeenCalled();
     }
