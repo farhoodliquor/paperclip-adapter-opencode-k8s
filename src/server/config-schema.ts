@@ -56,6 +56,13 @@ export function getConfigSchema(): AdapterConfigSchema {
 
       // Kubernetes fields
       {
+        key: "serviceAccountName",
+        label: "Service Account",
+        type: "text",
+        hint: "Kubernetes ServiceAccount name for the Job pod; defaults to the namespace 'default' SA. Use a dedicated SA (e.g. paperclip-developer) when the Job needs API access.",
+        group: "Kubernetes",
+      },
+      {
         key: "namespace",
         label: "Namespace",
         type: "text",
