@@ -567,8 +567,14 @@ async function streamAndAwaitJob(
     );
 
     let gracePoller: ReturnType<typeof setInterval> | null = null;
+    // Maximum wall-clock time the grace poller will defer to pod-liveness checks.
+    // When completionTimeoutMs is 0 (unlimited job), cap at 20 minutes so we
+    // don't wait forever if the pod never exits but K8s never marks the job done.
+    const graceMaxWaitMs = completionTimeoutMs > 0 ? completionTimeoutMs : 20 * 60_000;
+    const graceStartTime = Date.now();
     const completionGraced = new Promise<JobCompletionResult>((resolve, reject) => {
       let settled = false;
+      let graceCheckPending = false;
       const settleOk = (r: JobCompletionResult) => {
         if (settled) return;
         settled = true;
@@ -585,9 +591,33 @@ async function streamAndAwaitJob(
       };
       waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath).then(settleOk).catch(settleErr);
       gracePoller = setInterval(() => {
+        if (graceCheckPending || settled) return;
         if (logExitTime !== null && Date.now() - logExitTime >= LOG_EXIT_COMPLETION_GRACE_MS) {
-          void onLog("stdout", `[paperclip] Log stream exited ${LOG_EXIT_COMPLETION_GRACE_MS / 1000}s ago without K8s Job condition update — proceeding with captured output\n`).catch(() => {});
-          settleOk({ succeeded: false, timedOut: false, jobGone: true });
+          graceCheckPending = true;
+          void (async () => {
+            try {
+              // If we haven't exceeded the max wait, check whether the pod is still running.
+              // The K8s log client v1.x closes the follow-stream prematurely even when the
+              // container is still executing — the log exit does not mean the job is done.
+              if (Date.now() - graceStartTime < graceMaxWaitMs) {
+                try {
+                  const pod = await getCoreApi(kubeconfigPath).readNamespacedPod({ name: podName, namespace });
+                  const phase = pod.status?.phase;
+                  if (phase === "Running" || phase === "Pending") {
+                    // Pod still alive — reset the grace deadline and keep waiting
+                    logExitTime = Date.now();
+                    return;
+                  }
+                } catch {
+                  // Pod gone (404) or K8s error — fall through to settleOk
+                }
+              }
+              void onLog("stdout", `[paperclip] Log stream exited ${LOG_EXIT_COMPLETION_GRACE_MS / 1000}s ago without K8s Job condition update — proceeding with captured output\n`).catch(() => {});
+              settleOk({ succeeded: false, timedOut: false, jobGone: true });
+            } finally {
+              graceCheckPending = false;
+            }
+          })();
         }
       }, 1_000);
     });
