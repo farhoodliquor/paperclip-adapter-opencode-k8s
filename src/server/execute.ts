@@ -17,6 +17,7 @@ import { Writable } from "node:stream";
 const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
 const LOG_STREAM_RECONNECT_DELAY_MS = 3_000;
+const LOG_STREAM_RECONNECT_MAX_DELAY_MS = 30_000;
 const MAX_LOG_RECONNECT_ATTEMPTS = 50;
 // Upper bound on how long streamPodLogsOnce will wait after stopSignal fires
 // before force-returning, even if logApi.log has not yet resolved. Defensive
@@ -283,8 +284,14 @@ async function streamPodLogs(
 
     if (stopSignal?.stopped) break;
 
-    // Brief pause before reconnecting to avoid tight loops.
-    await new Promise((resolve) => setTimeout(resolve, LOG_STREAM_RECONNECT_DELAY_MS));
+    // Exponential backoff before reconnecting: start at 3s, double each
+    // attempt, cap at 30s. Avoids hammering the API server during prolonged
+    // network hiccups while staying responsive for brief disconnects.
+    const backoffMs = Math.min(
+      LOG_STREAM_RECONNECT_MAX_DELAY_MS,
+      LOG_STREAM_RECONNECT_DELAY_MS * 2 ** (attempt - 1),
+    );
+    await new Promise((resolve) => setTimeout(resolve, backoffMs));
   }
 
   // Flush any buffered partial line so the final assistant/result chunk
@@ -1059,6 +1066,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     instructionsContent: instructionsContent || undefined,
     skillsBundleContent: skillsBundleContent || undefined,
     agentDbClaimName,
+    retainJobs,
   };
   const firstBuild = buildJobManifest(buildArgs);
   const { jobName, namespace, prompt, opencodeArgs, promptMetrics } = firstBuild;
