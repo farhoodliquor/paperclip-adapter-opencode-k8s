@@ -167,13 +167,6 @@ export function getConfigSchema(): AdapterConfigSchema {
         hint: "When a running Job for the same task is found after a server restart, reattach (stream logs and await completion) instead of blocking",
         group: "Kubernetes",
       },
-      {
-        key: "serviceAccountName",
-        label: "Service Account",
-        type: "text",
-        hint: "Kubernetes ServiceAccount name for the Job pod; defaults to the namespace 'default' SA. Use a dedicated SA (e.g. paperclip-developer) when the Job needs API access.",
-        group: "Kubernetes",
-      },
 
       // Operational fields (timeoutSec and graceSec are provided by the platform)
     ],
