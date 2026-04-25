@@ -174,3 +174,46 @@ export function resetCache(): void {
   kcCache.clear();
   cachedSelfPod = null;
 }
+
+function isNotFound(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const asAny = err as unknown as Record<string, unknown>;
+  if (typeof asAny.statusCode === "number" && asAny.statusCode === 404) return true;
+  const resp = asAny.response as Record<string, unknown> | undefined;
+  return typeof resp?.statusCode === "number" && resp.statusCode === 404;
+}
+
+/** Returns the PVC if it exists, or null if not found. Throws on other errors. */
+export async function getPvc(
+  namespace: string,
+  name: string,
+  kubeconfigPath?: string,
+): Promise<k8s.V1PersistentVolumeClaim | null> {
+  try {
+    return await getCoreApi(kubeconfigPath).readNamespacedPersistentVolumeClaim({ name, namespace });
+  } catch (err) {
+    if (isNotFound(err)) return null;
+    throw err;
+  }
+}
+
+export async function createPvc(
+  namespace: string,
+  spec: k8s.V1PersistentVolumeClaim,
+  kubeconfigPath?: string,
+): Promise<k8s.V1PersistentVolumeClaim> {
+  return getCoreApi(kubeconfigPath).createNamespacedPersistentVolumeClaim({ namespace, body: spec });
+}
+
+/** Deletes a PVC, ignoring 404 (already gone). */
+export async function deletePvc(
+  namespace: string,
+  name: string,
+  kubeconfigPath?: string,
+): Promise<void> {
+  try {
+    await getCoreApi(kubeconfigPath).deleteNamespacedPersistentVolumeClaim({ name, namespace });
+  } catch (err) {
+    if (!isNotFound(err)) throw err;
+  }
+}

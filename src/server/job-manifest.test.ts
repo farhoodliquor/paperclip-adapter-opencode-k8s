@@ -286,108 +286,77 @@ describe("buildJobManifest", () => {
   });
 });
 
-const mockSelfPodWithPvc: JobBuildInput["selfPod"] = {
-  ...mockSelfPod,
-  pvcClaimName: "data-pvc",
-};
+describe("agentDbClaimName — OPENCODE_DB env var", () => {
+  it("sets OPENCODE_DB to /opencode-db when agentDbClaimName is a string (dedicated PVC)", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, agentDbClaimName: "opencode-db-agent-abc" });
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    expect(env.find((e) => e.name === "OPENCODE_DB")?.value).toBe("/opencode-db");
+  });
 
-describe("OPENCODE_DB env var", () => {
-  it("sets OPENCODE_DB to default per-agent path in shared_pvc mode", () => {
+  it("sets OPENCODE_DB to /opencode-db when agentDbClaimName is null (ephemeral)", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, agentDbClaimName: null });
+    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
+    expect(env.find((e) => e.name === "OPENCODE_DB")?.value).toBe("/opencode-db");
+  });
+
+  it("does not set OPENCODE_DB when agentDbClaimName is undefined", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
     const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
-    const dbEnv = env.find((e) => e.name === "OPENCODE_DB");
-    expect(dbEnv?.value).toBe(`/paperclip/.opencode/db/${mockCtx.agent.id}`);
+    expect(env.find((e) => e.name === "OPENCODE_DB")).toBeUndefined();
   });
 
-  it("uses opencodeDbPath override when set in shared_pvc mode", () => {
-    const ctx = { ...mockCtx, config: { opencodeDbPath: "/custom/db/path" } };
-    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+  it("replaces a user-provided OPENCODE_DB env override with /opencode-db", () => {
+    const selfPod = { ...mockSelfPod, inheritedEnv: { OPENCODE_DB: "/user/override" } };
+    const result = buildJobManifest({ ctx: mockCtx, selfPod, agentDbClaimName: "opencode-db-agent-abc" });
     const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
-    const dbEnv = env.find((e) => e.name === "OPENCODE_DB");
-    expect(dbEnv?.value).toBe("/custom/db/path");
-  });
-
-  it("sets OPENCODE_DB to /opencode-db in ephemeral mode", () => {
-    const ctx = { ...mockCtx, config: { opencodeDbMode: "ephemeral" } };
-    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
-    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
-    const dbEnv = env.find((e) => e.name === "OPENCODE_DB");
-    expect(dbEnv?.value).toBe("/opencode-db");
-  });
-
-  it("ignores opencodeDbPath in ephemeral mode", () => {
-    const ctx = { ...mockCtx, config: { opencodeDbMode: "ephemeral", opencodeDbPath: "/ignored" } };
-    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
-    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
-    const dbEnv = env.find((e) => e.name === "OPENCODE_DB");
-    expect(dbEnv?.value).toBe("/opencode-db");
-  });
-
-  it("defaults to shared_pvc when opencodeDbMode is unset", () => {
-    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
-    const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
-    const dbEnv = env.find((e) => e.name === "OPENCODE_DB");
-    expect(dbEnv?.value).toContain("/paperclip/.opencode/db/");
+    const dbEntries = env.filter((e) => e.name === "OPENCODE_DB");
+    expect(dbEntries).toHaveLength(1);
+    expect(dbEntries[0].value).toBe("/opencode-db");
   });
 });
 
-describe("ephemeral DB volume", () => {
-  it("adds opencode-db emptyDir volume in ephemeral mode", () => {
-    const ctx = { ...mockCtx, config: { opencodeDbMode: "ephemeral" } };
-    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+describe("agentDbClaimName — volume wiring", () => {
+  it("mounts dedicated PVC at /opencode-db when agentDbClaimName is a string", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, agentDbClaimName: "opencode-db-agent-abc" });
     const volumes = result.job.spec?.template?.spec?.volumes ?? [];
-    const dbVolume = volumes.find((v) => v.name === "opencode-db");
-    expect(dbVolume?.emptyDir).toBeDefined();
-  });
+    const dbVol = volumes.find((v) => v.name === "opencode-db");
+    expect(dbVol?.persistentVolumeClaim?.claimName).toBe("opencode-db-agent-abc");
 
-  it("mounts opencode-db at /opencode-db in the main container in ephemeral mode", () => {
-    const ctx = { ...mockCtx, config: { opencodeDbMode: "ephemeral" } };
-    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
     const mounts = result.job.spec?.template?.spec?.containers?.[0].volumeMounts ?? [];
-    const dbMount = mounts.find((m) => m.name === "opencode-db");
-    expect(dbMount?.mountPath).toBe("/opencode-db");
+    expect(mounts.find((m) => m.name === "opencode-db")?.mountPath).toBe("/opencode-db");
   });
 
-  it("does not add opencode-db volume in shared_pvc mode", () => {
-    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPodWithPvc });
+  it("mounts emptyDir at /opencode-db when agentDbClaimName is null (ephemeral)", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, agentDbClaimName: null });
+    const volumes = result.job.spec?.template?.spec?.volumes ?? [];
+    const dbVol = volumes.find((v) => v.name === "opencode-db");
+    expect(dbVol?.emptyDir).toBeDefined();
+    expect(dbVol?.persistentVolumeClaim).toBeUndefined();
+
+    const mounts = result.job.spec?.template?.spec?.containers?.[0].volumeMounts ?? [];
+    expect(mounts.find((m) => m.name === "opencode-db")?.mountPath).toBe("/opencode-db");
+  });
+
+  it("does not add opencode-db volume when agentDbClaimName is undefined", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
     const volumes = result.job.spec?.template?.spec?.volumes ?? [];
     expect(volumes.find((v) => v.name === "opencode-db")).toBeUndefined();
   });
 });
 
-describe("init container mkdir for shared_pvc", () => {
-  it("adds mkdir -p to init container command when PVC is present and mode is shared_pvc", () => {
-    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPodWithPvc });
+describe("init container is unchanged by agentDbClaimName", () => {
+  it("does not add mkdir or extra env vars to init container for dedicated PVC mode", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, agentDbClaimName: "opencode-db-agent-abc" });
     const initCmd = result.job.spec?.template?.spec?.initContainers?.[0].command;
-    expect(initCmd?.[2]).toContain("mkdir -p");
-  });
-
-  it("mounts PVC in init container for shared_pvc mode with PVC", () => {
-    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPodWithPvc });
-    const initMounts = result.job.spec?.template?.spec?.initContainers?.[0].volumeMounts ?? [];
-    expect(initMounts.some((m) => m.name === "data")).toBe(true);
-  });
-
-  it("passes OPENCODE_DB_PATH env var to init container in shared_pvc mode with PVC", () => {
-    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPodWithPvc });
+    expect(initCmd?.[2]).not.toContain("mkdir");
     const initEnv = result.job.spec?.template?.spec?.initContainers?.[0].env ?? [];
-    const dbPathEnv = initEnv.find((e) => e.name === "OPENCODE_DB_PATH");
-    expect(dbPathEnv?.value).toBe(`/paperclip/.opencode/db/${mockCtx.agent.id}`);
+    expect(initEnv.some((e) => e.name === "OPENCODE_DB_PATH")).toBe(false);
   });
 
-  it("does not add mkdir when PVC is not present in shared_pvc mode", () => {
-    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod }); // no PVC
-    const initCmd = result.job.spec?.template?.spec?.initContainers?.[0].command;
-    expect(initCmd?.[2]).not.toContain("mkdir");
-  });
-
-  it("does not add mkdir or PVC mount in ephemeral mode even when PVC is present", () => {
-    const ctx = { ...mockCtx, config: { opencodeDbMode: "ephemeral" } };
-    const result = buildJobManifest({ ctx, selfPod: mockSelfPodWithPvc });
-    const initCmd = result.job.spec?.template?.spec?.initContainers?.[0].command;
-    expect(initCmd?.[2]).not.toContain("mkdir");
+  it("does not add PVC mount to init container for dedicated PVC mode", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, agentDbClaimName: "opencode-db-agent-abc" });
     const initMounts = result.job.spec?.template?.spec?.initContainers?.[0].volumeMounts ?? [];
-    expect(initMounts.some((m) => m.name === "data")).toBe(false);
+    expect(initMounts.some((m) => m.name === "opencode-db")).toBe(false);
   });
 });
 

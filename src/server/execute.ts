@@ -8,7 +8,7 @@ import {
   isOpenCodeUnknownSessionError,
   isOpenCodeStepLimitResult,
 } from "./parse.js";
-import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi } from "./k8s-client.js";
+import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, getPvc, createPvc } from "./k8s-client.js";
 import { buildJobManifest, LARGE_PROMPT_THRESHOLD_BYTES } from "./job-manifest.js";
 import { LogLineDedupFilter } from "./log-dedup.js";
 import type * as k8s from "@kubernetes/client-node";
@@ -831,6 +831,58 @@ function ensureSigtermHandler(): void {
   });
 }
 
+/**
+ * Ensure the per-agent dedicated PVC exists (dedicated_pvc mode) or return null (ephemeral).
+ * Returns the PVC claim name on success, null when agentDbMode is "ephemeral".
+ * Throws when agentDbStorageClass is missing in dedicated_pvc mode.
+ */
+export async function ensureAgentDbPvc(
+  agentId: string,
+  namespace: string,
+  config: Record<string, unknown>,
+  kubeconfigPath?: string,
+): Promise<string | null> {
+  const agentDbMode = (asString(config.agentDbMode, "dedicated_pvc").trim() || "dedicated_pvc") as "dedicated_pvc" | "ephemeral";
+  if (agentDbMode === "ephemeral") return null;
+
+  // Build a K8s-safe PVC name from the agent ID (UUIDs are already alphanumeric+hyphens)
+  const agentSlug = agentId.toLowerCase().replace(/[^a-z0-9-]/g, "").replace(/^-+|-+$/g, "").slice(0, 208);
+  const pvcName = `opencode-db-${agentSlug}`;
+
+  const existing = await getPvc(namespace, pvcName, kubeconfigPath);
+  if (existing) return pvcName;
+
+  const storageClass = asString(config.agentDbStorageClass, "").trim();
+  if (!storageClass) {
+    throw new Error(
+      "agentDbStorageClass is required when agentDbMode is \"dedicated_pvc\" but is not configured. " +
+      "Set agentDbStorageClass in the adapter config or switch agentDbMode to \"ephemeral\".",
+    );
+  }
+  const capacity = asString(config.agentDbStorageCapacity, "1Gi").trim() || "1Gi";
+
+  await createPvc(namespace, {
+    apiVersion: "v1",
+    kind: "PersistentVolumeClaim",
+    metadata: {
+      name: pvcName,
+      namespace,
+      labels: {
+        "app.kubernetes.io/managed-by": "paperclip",
+        "paperclip.io/agent-id": agentId,
+        "paperclip.io/pvc-type": "agent-db",
+      },
+    },
+    spec: {
+      accessModes: ["ReadWriteOnce"],
+      storageClassName: storageClass,
+      resources: { requests: { storage: capacity } },
+    },
+  }, kubeconfigPath);
+
+  return pvcName;
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { config: rawConfig, onLog, onMeta } = ctx;
   const config = parseObject(rawConfig);
@@ -985,11 +1037,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // non-fatal: skill bundle is optional
   }
 
+  // Ensure per-agent DB PVC exists (or get null for ephemeral mode)
+  let agentDbClaimName: string | null | undefined;
+  try {
+    agentDbClaimName = await ensureAgentDbPvc(agentId, guardNamespace, config, kubeconfigPath);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await onLog("stderr", `[paperclip] Failed to ensure agent DB PVC: ${msg}\n`);
+    return {
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      errorMessage: msg,
+      errorCode: "k8s_job_create_failed",
+    };
+  }
+
   const buildArgs = {
     ctx,
     selfPod,
     instructionsContent: instructionsContent || undefined,
     skillsBundleContent: skillsBundleContent || undefined,
+    agentDbClaimName,
   };
   const firstBuild = buildJobManifest(buildArgs);
   const { jobName, namespace, prompt, opencodeArgs, promptMetrics } = firstBuild;

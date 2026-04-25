@@ -91,6 +91,8 @@ async function checkRbac(
     { resource: "secrets", group: "", verb: "delete", code: "k8s_rbac_secret_delete", label: "delete Secrets" },
     { resource: "secrets", group: "", verb: "get", code: "k8s_rbac_secret_get", label: "get Secrets" },
     { resource: "persistentvolumeclaims", group: "", verb: "get", code: "k8s_rbac_pvc_get", label: "get PersistentVolumeClaims" },
+    { resource: "persistentvolumeclaims", group: "", verb: "create", code: "k8s_rbac_pvc_create", label: "create PersistentVolumeClaims" },
+    { resource: "persistentvolumeclaims", group: "", verb: "delete", code: "k8s_rbac_pvc_delete", label: "delete PersistentVolumeClaims" },
   ];
 
   for (const check of rbacChecks) {

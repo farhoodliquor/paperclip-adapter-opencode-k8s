@@ -9,6 +9,8 @@ vi.mock("./k8s-client.js", () => ({
   getBatchApi: vi.fn(),
   getCoreApi: vi.fn(),
   getLogApi: vi.fn(),
+  getPvc: vi.fn().mockResolvedValue({ metadata: { name: "opencode-db-agent-id-test" } }),
+  createPvc: vi.fn().mockResolvedValue({}),
 }));
 
 vi.mock("./job-manifest.js", () => ({
