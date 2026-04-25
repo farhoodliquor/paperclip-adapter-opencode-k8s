@@ -288,7 +288,7 @@ describe("execute — concurrency guard", () => {
 });
 
 describe("execute — mutex serialization", () => {
-  it("serializes concurrent execute() calls for the same agent: second call sees first job", async () => {
+  it("second call waits for first job to finish then creates its own job (no permanent block)", async () => {
     // First call's createNamespacedJob blocks until we release it.
     let releaseFn!: () => void;
     const releasePromise = new Promise<void>((resolve) => { releaseFn = resolve; });
@@ -299,6 +299,7 @@ describe("execute — mutex serialization", () => {
       return { metadata: { uid: "uid-1" } };
     });
     // First guard call: no running jobs; second guard call: sees the running job.
+    // Third call (re-check after wait): default [] from makeBatchApi.
     batchApi.listNamespacedJob
       .mockResolvedValueOnce({ items: [] })
       .mockResolvedValueOnce({
@@ -306,6 +307,25 @@ describe("execute — mutex serialization", () => {
       });
 
     vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    // Extended coreApi that satisfies both execute() calls' pod queries:
+    // waitForPod needs phase=Running; getPodTerminatedInfo needs terminated.exitCode.
+    const coreApi = {
+      listNamespacedPod: vi.fn().mockResolvedValue({
+        items: [{
+          metadata: { name: POD_NAME },
+          status: {
+            phase: "Running",
+            containerStatuses: [{ name: "opencode", state: { terminated: { exitCode: 0 } } }],
+          },
+        }],
+      }),
+      readNamespacedPodLog: vi.fn().mockResolvedValue(HAPPY_JSONL),
+      createNamespacedSecret: vi.fn().mockResolvedValue({}),
+      deleteNamespacedSecret: vi.fn().mockResolvedValue({}),
+      patchNamespacedSecret: vi.fn().mockResolvedValue({}),
+    };
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
 
     const ctx = makeCtx();
     const first = execute(ctx);
@@ -317,10 +337,32 @@ describe("execute — mutex serialization", () => {
 
     const [, secondResult] = await Promise.all([first, second]);
 
-    // Only one job was created (mutex prevented a second concurrent creation).
-    expect(batchApi.createNamespacedJob).toHaveBeenCalledTimes(1);
-    // Second call found the running job and was blocked.
-    expect(secondResult.errorCode).toBe("k8s_concurrent_run_blocked");
+    // Second call should NOT be permanently blocked — it waited and created its own job.
+    expect(secondResult.errorCode).toBeUndefined();
+    expect(secondResult.exitCode).toBe(0);
+    // Both tasks created jobs (sequential, not concurrent).
+    expect(batchApi.createNamespacedJob).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns k8s_concurrent_run_blocked if job is still running after wait", async () => {
+    // Simulate a job that never completes from listNamespacedJob's perspective
+    // (always returns running), even though readNamespacedJob says Complete.
+    // This covers the re-check failing after the wait (e.g. a new job appeared).
+    const batchApi = makeBatchApi([
+      {
+        metadata: { name: "persistent-job" },
+        status: { conditions: [] }, // always appears running in list
+      },
+    ]);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const ctx = makeCtx();
+    const result = await execute(ctx);
+
+    // Waited for the job (readNamespacedJob returned Complete), re-checked (still
+    // appears running in list), returned blocked.
+    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
+    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
   });
 });
 

@@ -855,63 +855,88 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   try {
     // Guard: single concurrency per agent (shared PVC/session) — fail-closed.
-    try {
-      const batchApi = getBatchApi(kubeconfigPath);
-      const existing = await batchApi.listNamespacedJob({
-        namespace: guardNamespace,
-        labelSelector: `paperclip.io/agent-id=${agentId},paperclip.io/adapter-type=opencode_k8s`,
-      });
-      const running = existing.items.filter(
-        (j) => !j.status?.conditions?.some((c) => (c.type === "Complete" || c.type === "Failed") && c.status === "True"),
-      );
-      if (running.length > 0) {
-        // Separate Jobs matching the current task (orphaned from a prior server instance)
-        // from Jobs belonging to a different concurrent task.
-        const sameTaskJobs = taskId
-          ? running.filter((j) => j.metadata?.labels?.["paperclip.io/task-id"] === taskId)
-          : [];
-        const otherJobs = running.filter((j) => !sameTaskJobs.includes(j));
+    // When a concurrent job is detected, wait for it to finish and retry once rather
+    // than returning k8s_concurrent_run_blocked immediately (which caused permanent
+    // blocked state for all but the first task in a simultaneous batch assignment).
+    let waitedForConcurrent = false;
+    while (true) {
+      try {
+        const batchApi = getBatchApi(kubeconfigPath);
+        const existing = await batchApi.listNamespacedJob({
+          namespace: guardNamespace,
+          labelSelector: `paperclip.io/agent-id=${agentId},paperclip.io/adapter-type=opencode_k8s`,
+        });
+        const running = existing.items.filter(
+          (j) => !j.status?.conditions?.some((c) => (c.type === "Complete" || c.type === "Failed") && c.status === "True"),
+        );
+        if (running.length > 0) {
+          // Separate Jobs matching the current task (orphaned from a prior server instance)
+          // from Jobs belonging to a different concurrent task.
+          const sameTaskJobs = taskId
+            ? running.filter((j) => j.metadata?.labels?.["paperclip.io/task-id"] === taskId)
+            : [];
+          const otherJobs = running.filter((j) => !sameTaskJobs.includes(j));
 
-        if (otherJobs.length > 0) {
-          const names = otherJobs.map((j) => j.metadata?.name).join(", ");
-          await onLog("stderr", `[paperclip] Concurrent run blocked: existing Job(s) still running for this agent: ${names}\n`);
-          return {
-            exitCode: null,
-            signal: null,
-            timedOut: false,
-            errorMessage: `Concurrent run blocked: Job ${names} is still running for this agent`,
-            errorCode: "k8s_concurrent_run_blocked",
-          };
-        }
-
-        if (sameTaskJobs.length > 0) {
-          const orphanJob = sameTaskJobs[0];
-          const orphanJobName = orphanJob.metadata?.name ?? "";
-          if (reattachOrphanedJobs) {
-            await onLog("stdout", `[paperclip] Reattaching to orphaned Job ${orphanJobName} from prior server instance (task: ${taskId})...\n`);
-            activeJobs.set(orphanJobName, { namespace: guardNamespace, kubeconfigPath });
-            return streamAndAwaitJob(ctx, orphanJobName, guardNamespace, timeoutSec, graceSec, kubeconfigPath, retainJobs);
+          if (otherJobs.length > 0) {
+            if (waitedForConcurrent) {
+              // Already waited once — give up to avoid an infinite loop.
+              const names = otherJobs.map((j) => j.metadata?.name).join(", ");
+              await onLog("stderr", `[paperclip] Concurrent run blocked: existing Job(s) still running for this agent: ${names}\n`);
+              return {
+                exitCode: null,
+                signal: null,
+                timedOut: false,
+                errorMessage: `Concurrent run blocked: Job ${names} is still running for this agent`,
+                errorCode: "k8s_concurrent_run_blocked",
+              };
+            }
+            const names = otherJobs.map((j) => j.metadata?.name).join(", ");
+            await onLog("stdout", `[paperclip] Waiting for concurrent Job(s) to finish before starting: ${names}\n`);
+            // Wait up to the configured job timeout (+ grace + buffer); for unlimited jobs
+            // cap at 1 hour so we don't block the mutex indefinitely.
+            const concurrentWaitMs = timeoutSec > 0
+              ? (timeoutSec + graceSec + 120) * 1000
+              : 60 * 60_000;
+            await Promise.all(
+              otherJobs.map((j) =>
+                waitForJobCompletion(guardNamespace, j.metadata?.name ?? "", concurrentWaitMs, kubeconfigPath).catch(() => {}),
+              ),
+            );
+            await onLog("stdout", `[paperclip] Concurrent Job(s) done — retrying guard check...\n`);
+            waitedForConcurrent = true;
+            continue;
           }
-          await onLog("stderr", `[paperclip] Orphaned Job ${orphanJobName} found for this task but reattachOrphanedJobs is disabled.\n`);
-          return {
-            exitCode: null,
-            signal: null,
-            timedOut: false,
-            errorMessage: `Orphaned Job ${orphanJobName} is still running (reattachOrphanedJobs disabled)`,
-            errorCode: "k8s_concurrent_run_blocked",
-          };
+
+          if (sameTaskJobs.length > 0) {
+            const orphanJob = sameTaskJobs[0];
+            const orphanJobName = orphanJob.metadata?.name ?? "";
+            if (reattachOrphanedJobs) {
+              await onLog("stdout", `[paperclip] Reattaching to orphaned Job ${orphanJobName} from prior server instance (task: ${taskId})...\n`);
+              activeJobs.set(orphanJobName, { namespace: guardNamespace, kubeconfigPath });
+              return streamAndAwaitJob(ctx, orphanJobName, guardNamespace, timeoutSec, graceSec, kubeconfigPath, retainJobs);
+            }
+            await onLog("stderr", `[paperclip] Orphaned Job ${orphanJobName} found for this task but reattachOrphanedJobs is disabled.\n`);
+            return {
+              exitCode: null,
+              signal: null,
+              timedOut: false,
+              errorMessage: `Orphaned Job ${orphanJobName} is still running (reattachOrphanedJobs disabled)`,
+              errorCode: "k8s_concurrent_run_blocked",
+            };
+          }
         }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await onLog("stderr", `[paperclip] Concurrency guard unreachable — cannot list Jobs: ${msg}\n`);
+        return {
+          exitCode: null,
+          signal: null,
+          timedOut: false,
+          errorMessage: `Concurrency guard unreachable: ${msg}`,
+          errorCode: "k8s_concurrency_guard_unreachable",
+        };
       }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      await onLog("stderr", `[paperclip] Concurrency guard unreachable — cannot list Jobs: ${msg}\n`);
-      return {
-        exitCode: null,
-        signal: null,
-        timedOut: false,
-        errorMessage: `Concurrency guard unreachable: ${msg}`,
-        errorCode: "k8s_concurrency_guard_unreachable",
-      };
+      break; // no blocking jobs — proceed to job creation
     }
 
   // Read agent instructions file (instructionsFilePath config field → system prompt prepend)
