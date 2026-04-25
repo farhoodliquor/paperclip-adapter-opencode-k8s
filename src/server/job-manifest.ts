@@ -233,6 +233,13 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const configuredCwd = asString(config.cwd, "");
   const workingDir = workspaceCwd || configuredCwd || "/paperclip";
 
+  // OpenCode DB configuration
+  const opencodeDbMode = (asString(config.opencodeDbMode, "shared_pvc").trim() || "shared_pvc") as "shared_pvc" | "ephemeral";
+  const opencodeDbPathOverride = asString(config.opencodeDbPath, "").trim();
+  const resolvedDbPath = opencodeDbMode === "ephemeral"
+    ? "/opencode-db"
+    : (opencodeDbPathOverride || `/paperclip/.opencode/db/${agent.id}`);
+
   // Job naming: slug + 6-char hash for collision resistance; strip trailing hyphens
   const agentSlug = sanitizeForK8sName(agent.id);
   const runSlug = sanitizeForK8sName(runId);
@@ -296,6 +303,14 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // Build env vars
   const envVars = buildEnvVars(ctx, selfPod, config);
 
+  // OPENCODE_DB: always set after user overrides to enforce per-agent isolation or ephemeral mode
+  const dbEnvIdx = envVars.findIndex((e) => e.name === "OPENCODE_DB");
+  if (dbEnvIdx >= 0) {
+    envVars[dbEnvIdx] = { name: "OPENCODE_DB", value: resolvedDbPath };
+  } else {
+    envVars.push({ name: "OPENCODE_DB", value: resolvedDbPath });
+  }
+
   // Runtime config for permissions
   const runtimeConfigJson = buildRuntimeConfigJson(config);
 
@@ -345,6 +360,12 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     volumeMounts.push({ name: "data", mountPath: "/paperclip" });
   }
 
+  // Ephemeral DB volume (only for ephemeral mode)
+  if (opencodeDbMode === "ephemeral") {
+    volumes.push({ name: "opencode-db", emptyDir: {} });
+    volumeMounts.push({ name: "opencode-db", mountPath: "/opencode-db" });
+  }
+
   // Mount secret volumes inherited from the Deployment pod
   for (const sv of selfPod.secretVolumes) {
     volumes.push({
@@ -373,6 +394,25 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     fsGroup: 1000,
     fsGroupChangePolicy: "OnRootMismatch",
   };
+
+  // Build init container pieces
+  // shared_pvc mode: prepend mkdir -p to guarantee the per-agent DB dir exists before opencode starts
+  const useSharedPvcMkdir = opencodeDbMode === "shared_pvc" && Boolean(selfPod.pvcClaimName);
+  const dbSetupPrefix = useSharedPvcMkdir ? `mkdir -p "$OPENCODE_DB_PATH" && ` : "";
+  const initVolumeMounts: k8s.V1VolumeMount[] = [{ name: "prompt", mountPath: "/tmp/prompt" }];
+  const initEnvVars: k8s.V1EnvVar[] = [];
+  if (input.promptSecretName) {
+    initVolumeMounts.push({ name: "prompt-secret", mountPath: "/tmp/prompt-secret", readOnly: true });
+  } else {
+    initEnvVars.push({ name: "PROMPT_CONTENT", value: prompt });
+  }
+  if (useSharedPvcMkdir) {
+    initVolumeMounts.push({ name: "data", mountPath: "/paperclip" });
+    initEnvVars.push({ name: "OPENCODE_DB_PATH", value: resolvedDbPath });
+  }
+  const initContainerCommand = input.promptSecretName
+    ? `${dbSetupPrefix}cp /tmp/prompt-secret/prompt /tmp/prompt/prompt.txt`
+    : `${dbSetupPrefix}printf '%s' "$PROMPT_CONTENT" > /tmp/prompt/prompt.txt`;
 
   // Build the main container command
   // 1. Optionally write opencode runtime config for permission bypass
@@ -414,19 +454,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
               name: "write-prompt",
               image: "busybox:1.36",
               imagePullPolicy: "IfNotPresent",
-              ...(input.promptSecretName
-                ? {
-                    command: ["sh", "-c", "cp /tmp/prompt-secret/prompt /tmp/prompt/prompt.txt"],
-                    volumeMounts: [
-                      { name: "prompt", mountPath: "/tmp/prompt" },
-                      { name: "prompt-secret", mountPath: "/tmp/prompt-secret", readOnly: true },
-                    ],
-                  }
-                : {
-                    command: ["sh", "-c", "printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt"],
-                    env: [{ name: "PROMPT_CONTENT", value: prompt }],
-                    volumeMounts: [{ name: "prompt", mountPath: "/tmp/prompt" }],
-                  }),
+              command: ["sh", "-c", initContainerCommand],
+              ...(initEnvVars.length > 0 ? { env: initEnvVars } : {}),
+              volumeMounts: initVolumeMounts,
               securityContext,
               resources: {
                 requests: { cpu: "10m", memory: "16Mi" },

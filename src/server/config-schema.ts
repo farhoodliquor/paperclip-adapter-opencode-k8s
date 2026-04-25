@@ -26,6 +26,25 @@ export function getConfigSchema(): AdapterConfigSchema {
         hint: "Inject runtime config with permission.external_directory=allow",
         group: "Core",
       },
+      {
+        key: "opencodeDbMode",
+        label: "OpenCode DB Mode",
+        type: "select",
+        options: [
+          { label: "Shared PVC (per-agent path)", value: "shared_pvc" },
+          { label: "Ephemeral (emptyDir)", value: "ephemeral" },
+        ],
+        default: "shared_pvc",
+        hint: "shared_pvc stores the DB on the PVC at /paperclip/.opencode/db/<agentId>; ephemeral uses a Job-local emptyDir (lost after each run)",
+        group: "Core",
+      },
+      {
+        key: "opencodeDbPath",
+        label: "OpenCode DB Path Override",
+        type: "text",
+        hint: "Optional: override the OPENCODE_DB path (only used in shared_pvc mode); defaults to /paperclip/.opencode/db/<agentId>",
+        group: "Core",
+      },
 
       // Kubernetes fields
       {

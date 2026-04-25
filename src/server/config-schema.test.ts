@@ -85,6 +85,24 @@ describe("getConfigSchema", () => {
     }
   });
 
+  it("has opencodeDbMode as select with shared_pvc default", () => {
+    const schema = getConfigSchema();
+    const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "opencodeDbMode");
+    expect(field).toBeDefined();
+    expect(field!.type).toBe("select");
+    expect(field!.default).toBe("shared_pvc");
+    expect(field!.options).toContainEqual(expect.objectContaining({ value: "shared_pvc" }));
+    expect(field!.options).toContainEqual(expect.objectContaining({ value: "ephemeral" }));
+  });
+
+  it("has opencodeDbPath as optional text field with no default", () => {
+    const schema = getConfigSchema();
+    const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "opencodeDbPath");
+    expect(field).toBeDefined();
+    expect(field!.type).toBe("text");
+    expect(field!.default).toBeUndefined();
+  });
+
   it("has nodeSelector and tolerations as textarea", () => {
     const schema = getConfigSchema();
     const nodeField = schema.fields.find((f: ConfigFieldSchema) => f.key === "nodeSelector");
