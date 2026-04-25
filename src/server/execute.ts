@@ -287,11 +287,18 @@ async function streamPodLogs(
     // Exponential backoff before reconnecting: start at 3s, double each
     // attempt, cap at 30s. Avoids hammering the API server during prolonged
     // network hiccups while staying responsive for brief disconnects.
+    // Sleep in 200ms chunks so a stop signal can interrupt the backoff
+    // without waiting for the full delay to expire.
     const backoffMs = Math.min(
       LOG_STREAM_RECONNECT_MAX_DELAY_MS,
       LOG_STREAM_RECONNECT_DELAY_MS * 2 ** (attempt - 1),
     );
-    await new Promise((resolve) => setTimeout(resolve, backoffMs));
+    const backoffDeadline = Date.now() + backoffMs;
+    while (!stopSignal?.stopped) {
+      const remaining = backoffDeadline - Date.now();
+      if (remaining <= 0) break;
+      await new Promise<void>((resolve) => setTimeout(resolve, Math.min(200, remaining)));
+    }
   }
 
   // Flush any buffered partial line so the final assistant/result chunk
