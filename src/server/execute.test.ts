@@ -54,7 +54,7 @@ const HAPPY_JSONL = [
   JSON.stringify({ type: "step_finish", part: { tokens: { input: 100, output: 50, cache: { read: 20 } }, cost: 0.002 } }),
 ].join("\n");
 
-function makeCtx(configOverrides: Record<string, unknown> = {}): AdapterExecutionContext {
+function makeCtx(configOverrides: Record<string, unknown> = {}, contextOverrides: Record<string, unknown> = {}): AdapterExecutionContext {
   return {
     runId: "run-test-123",
     agent: { id: "agent-id-test", name: "Test Agent", companyId: "co-1", adapterType: null, adapterConfig: null },
@@ -68,6 +68,7 @@ function makeCtx(configOverrides: Record<string, unknown> = {}): AdapterExecutio
       paperclipWorkspaces: null,
       paperclipRuntimeServiceIntents: null,
       paperclipRuntimeServices: null,
+      ...contextOverrides,
     },
     onLog: vi.fn().mockResolvedValue(undefined),
   } as unknown as AdapterExecutionContext;
@@ -883,16 +884,17 @@ describe("execute — external cancel polling", () => {
     delete process.env.PAPERCLIP_API_KEY;
   });
 
-  it("returns errorCode=cancelled and deletes job when heartbeat-run status is not running", async () => {
+  it("returns errorCode=cancelled and deletes job when issue status is cancelled", async () => {
     vi.useFakeTimers();
 
     process.env.PAPERCLIP_API_URL = "http://test-api";
     process.env.PAPERCLIP_API_KEY = "test-key";
 
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+    const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       json: () => Promise.resolve({ status: "cancelled" }),
-    }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
 
     let jobDeleted = false;
     const batchApi = makeBatchApi();
@@ -909,7 +911,7 @@ describe("execute — external cancel polling", () => {
     });
     vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
 
-    const ctx = makeCtx();
+    const ctx = makeCtx({}, { issueId: "issue-test-456" });
     const executePromise = execute(ctx);
 
     // Advance in 1-second steps. vi.advanceTimersByTimeAsync fires fake timers
@@ -928,6 +930,10 @@ describe("execute — external cancel polling", () => {
     expect(batchApi.deleteNamespacedJob).toHaveBeenCalledWith(
       expect.objectContaining({ name: JOB_NAME, namespace: NAMESPACE, body: { propagationPolicy: "Background" } }),
     );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://test-api/api/issues/issue-test-456",
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer test-key" }) }),
+    );
   });
 
   it("does not cancel when PAPERCLIP_API_URL is absent", async () => {
@@ -941,7 +947,7 @@ describe("execute — external cancel polling", () => {
     expect(result.exitCode).toBe(0);
   });
 
-  it("does not cancel when heartbeat-run status is still running", async () => {
+  it("does not cancel when issue status is not cancelled", async () => {
     vi.useFakeTimers();
 
     process.env.PAPERCLIP_API_URL = "http://test-api";
@@ -949,10 +955,10 @@ describe("execute — external cancel polling", () => {
 
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
       ok: true,
-      json: () => Promise.resolve({ status: "running" }),
+      json: () => Promise.resolve({ status: "in_progress" }),
     }));
 
-    const ctx = makeCtx();
+    const ctx = makeCtx({}, { issueId: "issue-test-456" });
     const executePromise = execute(ctx);
 
     await vi.advanceTimersByTimeAsync(KEEPALIVE_MS + 500);

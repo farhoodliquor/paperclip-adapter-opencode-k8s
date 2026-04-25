@@ -495,7 +495,7 @@ async function streamAndAwaitJob(
     const logStopSignal = { stopped: false };
     const logDedup = new LogLineDedupFilter();
 
-    const runId = ctx.runId;
+    const issueId = asString(ctx.context.issueId ?? ctx.context.taskId, "").trim();
     let lastLogAt = Date.now();
     let keepaliveJobTerminal = false;
     let consecutiveTerminalReadings = 0;
@@ -525,22 +525,24 @@ async function streamAndAwaitJob(
       })();
     }, KEEPALIVE_INTERVAL_MS);
 
-    // External cancel poll: watches Paperclip run status at keepalive cadence.
+    // External cancel poll: watches Paperclip issue status at keepalive cadence.
+    // Polls GET /api/issues/{issueId} (not /api/heartbeat-runs) because the adapter
+    // key has read access to issues but not to the internal heartbeat-runs endpoint.
     // Uses await-setTimeout (not setInterval+void) so vi.advanceTimersByTimeAsync
     // can drive it in tests. Fire-and-forget; exits when logStopSignal.stopped.
     void (async (): Promise<void> => {
       const apiUrl = process.env.PAPERCLIP_API_URL;
-      if (!apiUrl || !runId) return;
+      if (!apiUrl || !issueId) return;
       while (!logStopSignal.stopped && !cancelSignal.cancelled) {
         await new Promise<void>((resolve) => setTimeout(resolve, KEEPALIVE_INTERVAL_MS));
         if (logStopSignal.stopped || cancelSignal.cancelled) break;
         try {
-          const resp = await fetch(`${apiUrl}/api/heartbeat-runs/${runId}`, {
+          const resp = await fetch(`${apiUrl}/api/issues/${issueId}`, {
             headers: { Authorization: `Bearer ${process.env.PAPERCLIP_API_KEY ?? ""}` },
           });
           if (resp.ok) {
             const data = await resp.json() as { status?: string };
-            if (typeof data.status === "string" && data.status !== "running") {
+            if (typeof data.status === "string" && data.status === "cancelled") {
               cancelSignal.cancelled = true;
               logStopSignal.stopped = true;
               try {
