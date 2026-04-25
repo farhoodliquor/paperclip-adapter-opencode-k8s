@@ -38,7 +38,9 @@ describe("ensureAgentDbPvc", () => {
   });
 
   it("creates PVC when it does not exist and returns the name", async () => {
-    vi.mocked(getPvc).mockResolvedValue(null);
+    vi.mocked(getPvc)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ metadata: { name: `opencode-db-${AGENT_ID}` } } as never);
     vi.mocked(createPvc).mockResolvedValue({} as never);
     const result = await ensureAgentDbPvc(AGENT_ID, NAMESPACE, {
       agentDbMode: "dedicated_pvc",
@@ -62,7 +64,9 @@ describe("ensureAgentDbPvc", () => {
   });
 
   it("defaults storage capacity to 1Gi when agentDbStorageCapacity is not set", async () => {
-    vi.mocked(getPvc).mockResolvedValue(null);
+    vi.mocked(getPvc)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ metadata: { name: `opencode-db-${AGENT_ID}` } } as never);
     vi.mocked(createPvc).mockResolvedValue({} as never);
     await ensureAgentDbPvc(AGENT_ID, NAMESPACE, {
       agentDbMode: "dedicated_pvc",
@@ -81,7 +85,9 @@ describe("ensureAgentDbPvc", () => {
 
   it("sanitizes agent ID in PVC name (strips non-alphanumeric except hyphens)", async () => {
     const weirdId = "Agent/ID:with@special!chars";
-    vi.mocked(getPvc).mockResolvedValue(null);
+    vi.mocked(getPvc)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ metadata: { name: "opencode-db-agentidwithspecialchars" } } as never);
     vi.mocked(createPvc).mockResolvedValue({} as never);
     const result = await ensureAgentDbPvc(weirdId, NAMESPACE, {
       agentDbMode: "dedicated_pvc",

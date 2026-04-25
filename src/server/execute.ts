@@ -897,6 +897,11 @@ export async function ensureAgentDbPvc(
     },
   }, kubeconfigPath);
 
+  const verified = await getPvc(namespace, pvcName, kubeconfigPath);
+  if (!verified) {
+    throw new Error(`PVC ${pvcName} was not created in namespace ${namespace}`);
+  }
+
   return pvcName;
 }
 
