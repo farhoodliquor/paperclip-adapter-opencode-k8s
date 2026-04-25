@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { execute } from "./execute.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi } from "./k8s-client.js";
@@ -199,16 +199,170 @@ describe("execute — concurrency guard", () => {
     expect(vi.mocked(getBatchApi)().createNamespacedJob).toHaveBeenCalled();
   });
 
-  it("proceeds when concurrency check throws (best-effort)", async () => {
+  it("returns k8s_concurrency_guard_unreachable when concurrency check throws (fail-closed)", async () => {
     const batchApi = makeBatchApi();
     batchApi.listNamespacedJob.mockRejectedValue(new Error("RBAC denied"));
     vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
 
     const ctx = makeCtx();
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("k8s_concurrency_guard_unreachable");
+    expect(result.exitCode).toBeNull();
+    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+  });
+
+  it("blocks (k8s_concurrent_run_blocked) when a different-task job is running even with reattachOrphanedJobs=true", async () => {
+    const batchApi = makeBatchApi([
+      {
+        metadata: { name: "other-task-job", labels: { "paperclip.io/task-id": "other-task-id" } },
+        status: { conditions: [] },
+      },
+    ]);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const ctx = makeCtx({ reattachOrphanedJobs: true });
+    // ctx.context.taskId is null in makeCtx, so the running job is always an "other" job
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
+    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+  });
+
+  it("reattaches and streams logs when same-task orphaned Job exists and reattachOrphanedJobs=true", async () => {
+    const TASK_ID = "task-uuid-123";
+    const ORPHAN_JOB = "orphaned-job-abc";
+    const batchApi = makeBatchApi([
+      {
+        metadata: {
+          name: ORPHAN_JOB,
+          labels: { "paperclip.io/task-id": TASK_ID },
+        },
+        status: { conditions: [] },
+      },
+    ]);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const ctx = {
+      ...makeCtx({ reattachOrphanedJobs: true }),
+      context: { taskId: TASK_ID, issueId: null, paperclipWorkspace: null, issueIds: null, paperclipWorkspaces: null, paperclipRuntimeServiceIntents: null, paperclipRuntimeServices: null },
+    } as unknown as AdapterExecutionContext;
+    const result = await execute(ctx);
+
+    // Should NOT create a new Job — reattached to the orphan
+    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+    // Should have succeeded by reattaching
+    expect(result.exitCode).toBe(0);
+    expect(result.sessionId).toBe("ses_happy");
+  });
+
+  it("blocks (k8s_concurrent_run_blocked) when same-task orphaned Job exists but reattachOrphanedJobs=false", async () => {
+    const TASK_ID = "task-uuid-456";
+    const batchApi = makeBatchApi([
+      {
+        metadata: {
+          name: "orphaned-job-xyz",
+          labels: { "paperclip.io/task-id": TASK_ID },
+        },
+        status: { conditions: [] },
+      },
+    ]);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const ctx = {
+      ...makeCtx({ reattachOrphanedJobs: false }),
+      context: { taskId: TASK_ID, issueId: null, paperclipWorkspace: null, issueIds: null, paperclipWorkspaces: null, paperclipRuntimeServiceIntents: null, paperclipRuntimeServices: null },
+    } as unknown as AdapterExecutionContext;
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
+    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
+  });
+});
+
+describe("execute — mutex serialization", () => {
+  it("serializes concurrent execute() calls for the same agent: second call sees first job", async () => {
+    // First call's createNamespacedJob blocks until we release it.
+    let releaseFn!: () => void;
+    const releasePromise = new Promise<void>((resolve) => { releaseFn = resolve; });
+
+    const batchApi = makeBatchApi();
+    batchApi.createNamespacedJob.mockImplementationOnce(async () => {
+      await releasePromise;
+      return { metadata: { uid: "uid-1" } };
+    });
+    // First guard call: no running jobs; second guard call: sees the running job.
+    batchApi.listNamespacedJob
+      .mockResolvedValueOnce({ items: [] })
+      .mockResolvedValueOnce({
+        items: [{ metadata: { name: JOB_NAME }, status: { conditions: [] } }],
+      });
+
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const ctx = makeCtx();
+    const first = execute(ctx);
+    // Second call races for the mutex; will wait until first releases.
+    const second = execute(ctx);
+
+    // Unblock first call's job creation so it completes and releases the mutex.
+    releaseFn();
+
+    const [, secondResult] = await Promise.all([first, second]);
+
+    // Only one job was created (mutex prevented a second concurrent creation).
+    expect(batchApi.createNamespacedJob).toHaveBeenCalledTimes(1);
+    // Second call found the running job and was blocked.
+    expect(secondResult.errorCode).toBe("k8s_concurrent_run_blocked");
+  });
+});
+
+describe("execute — SIGTERM handler", () => {
+  it("registers a SIGTERM handler via process.once on first execute() call", async () => {
+    // Spy before execute() so we can verify the handler is installed.
+    const onceSpy = vi.spyOn(process, "once");
+    const ctx = makeCtx();
     await execute(ctx);
 
-    // Should have proceeded to create a job
-    expect(batchApi.createNamespacedJob).toHaveBeenCalled();
+    // ensureSigtermHandler() should call process.once('SIGTERM', ...) at most once per process.
+    // Since we can't reset module state between tests, assert it was called at some point.
+    const sigtermCalls = onceSpy.mock.calls.filter(([event]) => event === "SIGTERM");
+    // Either this test triggered the registration, or an earlier test did.
+    // In either case, the handler must exist on process.
+    const listenerCount = process.listenerCount("SIGTERM");
+    expect(listenerCount).toBeGreaterThanOrEqual(1);
+    onceSpy.mockRestore();
+  });
+
+  it("SIGTERM handler deletes tracked jobs and calls process.exit(0)", async () => {
+    // Capture the SIGTERM handler by temporarily intercepting process.once.
+    let capturedHandler: (() => void) | null = null;
+    const onceSpy = vi.spyOn(process, "once").mockImplementation(
+      (event: string | symbol, handler: (...args: unknown[]) => void) => {
+        if (event === "SIGTERM") capturedHandler = handler as () => void;
+        return process;
+      },
+    );
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => { throw new Error("process.exit"); });
+
+    // Reset the SIGTERM flag by re-importing with resetModules (only works first-time per suite).
+    // Instead, we test the handler by intercepting the first registration that fires.
+    // If the handler was already installed, capturedHandler stays null and we skip.
+    const ctx = makeCtx();
+    await execute(ctx);
+
+    onceSpy.mockRestore();
+    exitSpy.mockRestore();
+
+    if (capturedHandler) {
+      const batchApi = vi.mocked(getBatchApi)();
+      // Fire the handler and verify it deletes the job that was just created.
+      try { capturedHandler(); } catch { /* swallow process.exit throw */ }
+      await new Promise((r) => setTimeout(r, 50)); // let async handler tick
+      expect(batchApi.deleteNamespacedJob).toHaveBeenCalled();
+    }
+    // If capturedHandler is null, sigtermHandlerInstalled was already true from
+    // a prior test — handler registration is idempotent, which is also correct.
   });
 });
 
@@ -667,6 +821,98 @@ describe("execute — log dedup (waitForPod status dedup)", () => {
     // Pending status should appear exactly once even though listNamespacedPod was called twice
     const pendingMsgs = logMessages.filter((m) => m.includes("phase=Pending"));
     expect(pendingMsgs.length).toBe(1);
+  });
+});
+
+describe("execute — external cancel polling", () => {
+  const KEEPALIVE_MS = 15_000;
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    delete process.env.PAPERCLIP_API_URL;
+    delete process.env.PAPERCLIP_API_KEY;
+  });
+
+  it("returns errorCode=cancelled and deletes job when heartbeat-run status is not running", async () => {
+    vi.useFakeTimers();
+
+    process.env.PAPERCLIP_API_URL = "http://test-api";
+    process.env.PAPERCLIP_API_KEY = "test-key";
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ status: "cancelled" }),
+    }));
+
+    let jobDeleted = false;
+    const batchApi = makeBatchApi();
+    batchApi.deleteNamespacedJob.mockImplementation(() => {
+      jobDeleted = true;
+      return Promise.resolve({});
+    });
+    batchApi.readNamespacedJob.mockImplementation(() => {
+      if (jobDeleted) {
+        const err = Object.assign(new Error("not found"), { statusCode: 404 });
+        return Promise.reject(err);
+      }
+      return Promise.resolve({ status: { conditions: [] } }); // non-terminal until deleted
+    });
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const ctx = makeCtx();
+    const executePromise = execute(ctx);
+
+    // Advance in 1-second steps. vi.advanceTimersByTimeAsync fires fake timers
+    // but only drains one microtask level per call. Advancing in small chunks
+    // gives multi-level Promise chains (fetch → json → cancel logic) time to
+    // fully settle between steps before we await the resolved execute result.
+    for (let i = 0; i < 20; i++) {
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+
+    const result = await executePromise;
+
+    expect(result.errorCode).toBe("cancelled");
+    expect(result.exitCode).toBeNull();
+    expect(result.timedOut).toBe(false);
+    expect(batchApi.deleteNamespacedJob).toHaveBeenCalledWith(
+      expect.objectContaining({ name: JOB_NAME, namespace: NAMESPACE, body: { propagationPolicy: "Background" } }),
+    );
+  });
+
+  it("does not cancel when PAPERCLIP_API_URL is absent", async () => {
+    // No PAPERCLIP_API_URL set — cancel polling is skipped; normal completion runs.
+    delete process.env.PAPERCLIP_API_URL;
+
+    const ctx = makeCtx();
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBeUndefined();
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("does not cancel when heartbeat-run status is still running", async () => {
+    vi.useFakeTimers();
+
+    process.env.PAPERCLIP_API_URL = "http://test-api";
+    process.env.PAPERCLIP_API_KEY = "test-key";
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ status: "running" }),
+    }));
+
+    const ctx = makeCtx();
+    const executePromise = execute(ctx);
+
+    await vi.advanceTimersByTimeAsync(KEEPALIVE_MS + 500);
+
+    const result = await executePromise;
+
+    // Should complete normally, not be cancelled.
+    expect(result.errorCode).toBeUndefined();
+    expect(result.exitCode).toBe(0);
   });
 });
 

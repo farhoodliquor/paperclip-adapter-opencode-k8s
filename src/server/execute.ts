@@ -410,42 +410,437 @@ async function cleanupJob(
   }
 }
 
-export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
-  const { runId, runtime, config: rawConfig, onLog, onMeta } = ctx;
-  const config = parseObject(rawConfig);
-  const timeoutSec = asNumber(config.timeoutSec, 0);
-  const graceSec = asNumber(config.graceSec, 60);
-  const retainJobs = asBoolean(config.retainJobs, false);
-  const kubeconfigPath = asString(config.kubeconfig, "") || undefined;
+/**
+ * Stream logs + await completion for an already-created Job, then harvest
+ * and return the execution result. Used by both the normal create-then-run
+ * path and the orphaned-job reattach path.
+ */
+async function streamAndAwaitJob(
+  ctx: AdapterExecutionContext,
+  jobName: string,
+  namespace: string,
+  timeoutSec: number,
+  graceSec: number,
+  kubeconfigPath: string | undefined,
+  retainJobs: boolean,
+  promptSecretName?: string,
+): Promise<AdapterExecutionResult> {
+  const { onLog } = ctx;
+  const config = parseObject(ctx.config);
   const model = asString(config.model, "").trim();
 
-  // Guard: single concurrency per agent (shared PVC/session)
-  const agentId = ctx.agent.id;
-  const selfPod = await getSelfPodInfo(kubeconfigPath);
-  const guardNamespace = asString(config.namespace, "") || selfPod.namespace;
+  let stdout = "";
+  let exitCode: number | null = null;
+  let jobTimedOut = false;
+  let podTerminatedReason: string | null = null;
+  let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+  const cancelSignal = { cancelled: false };
+
   try {
-    const batchApi = getBatchApi(kubeconfigPath);
-    const existing = await batchApi.listNamespacedJob({
-      namespace: guardNamespace,
-      labelSelector: `paperclip.io/agent-id=${agentId},paperclip.io/adapter-type=opencode_k8s`,
-    });
-    const running = existing.items.filter(
-      (j) => !j.status?.conditions?.some((c) => (c.type === "Complete" || c.type === "Failed") && c.status === "True"),
-    );
-    if (running.length > 0) {
-      const names = running.map((j) => j.metadata?.name).join(", ");
-      await onLog("stderr", `[paperclip] Concurrent run blocked: existing Job(s) still running for this agent: ${names}\n`);
+    const scheduleTimeoutMs = 120_000;
+    let podName: string;
+    try {
+      podName = await waitForPod(namespace, jobName, scheduleTimeoutMs, onLog, kubeconfigPath);
+      await onLog("stdout", `[paperclip] Pod running: ${podName}\n`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await onLog("stderr", `[paperclip] Pod scheduling failed: ${msg}\n`);
       return {
         exitCode: null,
         signal: null,
         timedOut: false,
-        errorMessage: `Concurrent run blocked: Job ${names} is still running for this agent`,
-        errorCode: "k8s_concurrent_run_blocked",
+        errorMessage: `Pod scheduling failed: ${msg}`,
+        errorCode: "k8s_pod_schedule_failed",
       };
     }
-  } catch {
-    // If we can't check, proceed — heartbeat service enforces concurrency too
+
+    const completionTimeoutMs = timeoutSec > 0 ? (timeoutSec + graceSec) * 1000 : 0;
+    const logStopSignal = { stopped: false };
+    const logDedup = new LogLineDedupFilter();
+
+    const runId = ctx.runId;
+    let lastLogAt = Date.now();
+    let keepaliveJobTerminal = false;
+    let consecutiveTerminalReadings = 0;
+    keepaliveTimer = setInterval(() => {
+      void (async () => {
+        if (keepaliveJobTerminal || cancelSignal.cancelled) return;
+
+        // Require two consecutive terminal readings before latching to
+        // guard against a stale K8s API cache returning a false terminal
+        // status on a single read.
+        try {
+          const j = await getBatchApi(kubeconfigPath).readNamespacedJob({ name: jobName, namespace });
+          const terminal = j.status?.conditions?.some(
+            (c) => (c.type === "Complete" || c.type === "Failed") && c.status === "True",
+          );
+          if (terminal) {
+            consecutiveTerminalReadings++;
+            if (consecutiveTerminalReadings >= 2) keepaliveJobTerminal = true;
+            return;
+          }
+          consecutiveTerminalReadings = 0;
+        } catch {
+          return;
+        }
+        const silenceSec = Math.round((Date.now() - lastLogAt) / 1000);
+        void onLog("stdout", `[paperclip] keepalive — job ${jobName} running (${silenceSec}s since last output)\n`).catch(() => {});
+      })();
+    }, KEEPALIVE_INTERVAL_MS);
+
+    // External cancel poll: watches Paperclip run status at keepalive cadence.
+    // Uses await-setTimeout (not setInterval+void) so vi.advanceTimersByTimeAsync
+    // can drive it in tests. Fire-and-forget; exits when logStopSignal.stopped.
+    void (async (): Promise<void> => {
+      const apiUrl = process.env.PAPERCLIP_API_URL;
+      if (!apiUrl || !runId) return;
+      while (!logStopSignal.stopped && !cancelSignal.cancelled) {
+        await new Promise<void>((resolve) => setTimeout(resolve, KEEPALIVE_INTERVAL_MS));
+        if (logStopSignal.stopped || cancelSignal.cancelled) break;
+        try {
+          const resp = await fetch(`${apiUrl}/api/heartbeat-runs/${runId}`, {
+            headers: { Authorization: `Bearer ${process.env.PAPERCLIP_API_KEY ?? ""}` },
+          });
+          if (resp.ok) {
+            const data = await resp.json() as { status?: string };
+            if (typeof data.status === "string" && data.status !== "running") {
+              cancelSignal.cancelled = true;
+              logStopSignal.stopped = true;
+              try {
+                await getBatchApi(kubeconfigPath).deleteNamespacedJob({
+                  name: jobName,
+                  namespace,
+                  body: { propagationPolicy: "Background" },
+                });
+              } catch { /* best-effort */ }
+            }
+          }
+        } catch { /* non-fatal */ }
+      }
+    })();
+
+    const wrappedOnLog: typeof onLog = async (stream, chunk) => {
+      lastLogAt = Date.now();
+      return onLog(stream, chunk);
+    };
+
+    let logExitTime: number | null = null;
+    const trackedLogStream = streamPodLogs(
+      namespace, podName, wrappedOnLog, kubeconfigPath, logStopSignal, logDedup,
+      () => { logExitTime = Date.now(); },
+    );
+
+    let gracePoller: ReturnType<typeof setInterval> | null = null;
+    const completionGraced = new Promise<JobCompletionResult>((resolve, reject) => {
+      let settled = false;
+      const settleOk = (r: JobCompletionResult) => {
+        if (settled) return;
+        settled = true;
+        if (gracePoller) { clearInterval(gracePoller); gracePoller = null; }
+        logStopSignal.stopped = true;
+        resolve(r);
+      };
+      const settleErr = (err: unknown) => {
+        if (settled) return;
+        settled = true;
+        if (gracePoller) { clearInterval(gracePoller); gracePoller = null; }
+        logStopSignal.stopped = true;
+        reject(err);
+      };
+      waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath).then(settleOk).catch(settleErr);
+      gracePoller = setInterval(() => {
+        if (logExitTime !== null && Date.now() - logExitTime >= LOG_EXIT_COMPLETION_GRACE_MS) {
+          void onLog("stdout", `[paperclip] Log stream exited ${LOG_EXIT_COMPLETION_GRACE_MS / 1000}s ago without K8s Job condition update — proceeding with captured output\n`).catch(() => {});
+          settleOk({ succeeded: false, timedOut: false, jobGone: true });
+        }
+      }, 1_000);
+    });
+
+    const [logResult, completionResult] = await Promise.allSettled([
+      trackedLogStream,
+      completionGraced,
+    ]);
+
+    if (keepaliveTimer) {
+      clearInterval(keepaliveTimer);
+      keepaliveTimer = null;
+    }
+
+    if (logResult.status === "fulfilled") {
+      stdout = logResult.value;
+    }
+
+    if (!stdout.trim()) {
+      await onLog("stdout", `[paperclip] Log stream returned empty — reading pod logs directly...\n`);
+      stdout = await readPodLogs(namespace, podName, kubeconfigPath);
+      if (stdout.trim()) {
+        await onLog("stdout", stdout);
+      }
+    } else if (!parseOpenCodeJsonl(stdout).sessionId) {
+      await onLog("stdout", `[paperclip] Partial stdout missing session result — reading pod logs directly...\n`);
+      const fallbackLogs = await readPodLogs(namespace, podName, kubeconfigPath);
+      if (fallbackLogs.trim()) {
+        stdout = fallbackLogs;
+        await onLog("stdout", fallbackLogs);
+      }
+    }
+
+    if (completionResult.status === "fulfilled") {
+      const completion = completionResult.value;
+      jobTimedOut = completion.timedOut;
+      if (completion.jobGone) {
+        await onLog("stdout", `[paperclip] Job ${jobName} not found (likely TTL-cleaned after completion).\n`);
+      }
+    } else {
+      jobTimedOut = true;
+    }
+
+    const terminatedInfo = await getPodTerminatedInfo(namespace, jobName, kubeconfigPath);
+    exitCode = terminatedInfo.exitCode;
+    podTerminatedReason = terminatedInfo.reason;
+  } finally {
+    if (keepaliveTimer) {
+      clearInterval(keepaliveTimer);
+      keepaliveTimer = null;
+    }
+    activeJobs.delete(jobName);
+    if (!retainJobs) {
+      await cleanupJob(namespace, jobName, onLog, kubeconfigPath, promptSecretName);
+    } else {
+      await onLog("stdout", `[paperclip] Retaining job ${jobName} for debugging (retainJobs=true)\n`);
+    }
   }
+
+  if (cancelSignal.cancelled) {
+    return {
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      errorMessage: "Run cancelled",
+      errorCode: "cancelled",
+    };
+  }
+
+  if (jobTimedOut) {
+    return {
+      exitCode,
+      signal: null,
+      timedOut: true,
+      errorMessage: `Timed out after ${timeoutSec}s`,
+      errorCode: "timeout",
+    };
+  }
+
+  const parsed = parseOpenCodeJsonl(stdout);
+  const runtimeSessionParams = parseObject(ctx.runtime.sessionParams);
+  const fallbackSessionId = asString(runtimeSessionParams.sessionId, ctx.runtime.sessionId ?? "");
+  const workspaceContext = parseObject(ctx.context.paperclipWorkspace);
+  const workspaceId = asString(workspaceContext.workspaceId, "") || null;
+  const workspaceRepoUrl = asString(workspaceContext.repoUrl, "") || null;
+  const workspaceRepoRef = asString(workspaceContext.repoRef, "") || null;
+  const cwd = asString(workspaceContext.cwd, "");
+
+  const resolvedSessionId = parsed.sessionId ?? (fallbackSessionId || null);
+  const resolvedSessionParams = resolvedSessionId
+    ? {
+        sessionId: resolvedSessionId,
+        ...(cwd ? { cwd } : {}),
+        ...(workspaceId ? { workspaceId } : {}),
+        ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
+        ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
+      } as Record<string, unknown>
+    : null;
+
+  const provider = parseModelProvider(model);
+  const biller = inferOpenAiCompatibleBiller(process.env, null) ?? provider ?? "unknown";
+
+  const parsedError = typeof parsed.errorMessage === "string" ? parsed.errorMessage.trim() : "";
+  const rawExitCode = exitCode;
+  const synthesizedExitCode = parsedError && (rawExitCode ?? 0) === 0 ? 1 : rawExitCode;
+  const failed = (synthesizedExitCode ?? 0) !== 0;
+
+  if (failed && isOpenCodeUnknownSessionError(stdout, parsedError)) {
+    await onLog("stdout", `[paperclip] OpenCode session is unavailable; clearing for next run.\n`);
+    return {
+      exitCode: synthesizedExitCode,
+      signal: null,
+      timedOut: false,
+      errorMessage: parsedError || "Session unavailable",
+      errorCode: "session_unavailable",
+      clearSession: true,
+      resultJson: { stdout },
+    };
+  }
+
+  const stepLimitReached = isOpenCodeStepLimitResult(stdout);
+  if (stepLimitReached) {
+    await onLog("stdout", `[paperclip] OpenCode step limit reached; clearing session for next run.\n`);
+  }
+
+  const hasLlmOutput = parsed.usage.outputTokens > 0 || !!parsed.summary;
+  if (!jobTimedOut && parsed.sessionId !== null && !hasLlmOutput && !parsedError) {
+    await onLog("stderr", `[paperclip] LLM returned empty response (0 output tokens).\n`);
+    return {
+      exitCode: synthesizedExitCode ?? 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: "LLM API returned empty response",
+      errorCode: "llm_api_error",
+      sessionId: resolvedSessionId,
+      sessionParams: resolvedSessionParams,
+      resultJson: { stdout },
+    };
+  }
+
+  const firstStderrLine = stdout.split(/\r?\n/).map((l) => l.trim()).find(Boolean) ?? "";
+  const podFailureDescription = podTerminatedReason
+    ? `Pod exited: ${podTerminatedReason}${synthesizedExitCode != null ? ` (exit ${synthesizedExitCode})` : ""}`
+    : null;
+  const errorParts = [parsedError, podFailureDescription].filter(Boolean);
+  const fallbackErrorMessage =
+    errorParts.join("; ") || firstStderrLine || `OpenCode exited with code ${synthesizedExitCode ?? -1}`;
+
+  return {
+    exitCode: synthesizedExitCode,
+    signal: null,
+    timedOut: false,
+    errorMessage: (synthesizedExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
+    usage: {
+      inputTokens: parsed.usage.inputTokens,
+      outputTokens: parsed.usage.outputTokens,
+      cachedInputTokens: parsed.usage.cachedInputTokens,
+    },
+    sessionId: resolvedSessionId,
+    sessionParams: resolvedSessionParams,
+    sessionDisplayId: resolvedSessionId,
+    provider,
+    model: model || null,
+    billingType: "unknown",
+    costUsd: parsed.costUsd,
+    resultJson: { stdout },
+    summary: parsed.summary,
+    clearSession: stepLimitReached,
+  } as AdapterExecutionResult;
+}
+
+// Per-agent mutex: serializes guard-check + job-create to prevent TOCTOU races.
+const agentCreationMutex = new Map<string, Promise<void>>();
+
+// Active Jobs tracked for SIGTERM cleanup.
+const activeJobs = new Map<string, { namespace: string; kubeconfigPath?: string; promptSecretName?: string }>();
+let sigtermHandlerInstalled = false;
+
+function ensureSigtermHandler(): void {
+  if (sigtermHandlerInstalled) return;
+  sigtermHandlerInstalled = true;
+  process.once("SIGTERM", () => {
+    void (async () => {
+      await Promise.allSettled(
+        Array.from(activeJobs.entries()).flatMap(([jobName, { namespace, kubeconfigPath, promptSecretName }]) => {
+          const ops: Promise<unknown>[] = [
+            getBatchApi(kubeconfigPath)
+              .deleteNamespacedJob({ name: jobName, namespace, body: { propagationPolicy: "Background" } })
+              .catch(() => {}),
+          ];
+          if (promptSecretName) {
+            ops.push(
+              getCoreApi(kubeconfigPath)
+                .deleteNamespacedSecret({ name: promptSecretName, namespace })
+                .catch(() => {}),
+            );
+          }
+          return ops;
+        }),
+      );
+      process.exit(0);
+    })();
+  });
+}
+
+export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  const { config: rawConfig, onLog, onMeta } = ctx;
+  const config = parseObject(rawConfig);
+  const timeoutSec = asNumber(config.timeoutSec, 0);
+  const graceSec = asNumber(config.graceSec, 60);
+  const retainJobs = asBoolean(config.retainJobs, false);
+  const reattachOrphanedJobs = asBoolean(config.reattachOrphanedJobs, false);
+  const kubeconfigPath = asString(config.kubeconfig, "") || undefined;
+
+  const agentId = ctx.agent.id;
+  const taskId = asString(ctx.context.taskId ?? ctx.context.issueId, "").trim();
+  const selfPod = await getSelfPodInfo(kubeconfigPath);
+  const guardNamespace = asString(config.namespace, "") || selfPod.namespace;
+  ensureSigtermHandler();
+
+  // Serialize guard-check + job-create per agent to prevent TOCTOU races.
+  const prevLock = agentCreationMutex.get(agentId) ?? Promise.resolve();
+  let releaseLock!: () => void;
+  agentCreationMutex.set(
+    agentId,
+    prevLock.then(() => new Promise<void>((resolve) => { releaseLock = resolve; })),
+  );
+  await prevLock;
+
+  try {
+    // Guard: single concurrency per agent (shared PVC/session) — fail-closed.
+    try {
+      const batchApi = getBatchApi(kubeconfigPath);
+      const existing = await batchApi.listNamespacedJob({
+        namespace: guardNamespace,
+        labelSelector: `paperclip.io/agent-id=${agentId},paperclip.io/adapter-type=opencode_k8s`,
+      });
+      const running = existing.items.filter(
+        (j) => !j.status?.conditions?.some((c) => (c.type === "Complete" || c.type === "Failed") && c.status === "True"),
+      );
+      if (running.length > 0) {
+        // Separate Jobs matching the current task (orphaned from a prior server instance)
+        // from Jobs belonging to a different concurrent task.
+        const sameTaskJobs = taskId
+          ? running.filter((j) => j.metadata?.labels?.["paperclip.io/task-id"] === taskId)
+          : [];
+        const otherJobs = running.filter((j) => !sameTaskJobs.includes(j));
+
+        if (otherJobs.length > 0) {
+          const names = otherJobs.map((j) => j.metadata?.name).join(", ");
+          await onLog("stderr", `[paperclip] Concurrent run blocked: existing Job(s) still running for this agent: ${names}\n`);
+          return {
+            exitCode: null,
+            signal: null,
+            timedOut: false,
+            errorMessage: `Concurrent run blocked: Job ${names} is still running for this agent`,
+            errorCode: "k8s_concurrent_run_blocked",
+          };
+        }
+
+        if (sameTaskJobs.length > 0) {
+          const orphanJob = sameTaskJobs[0];
+          const orphanJobName = orphanJob.metadata?.name ?? "";
+          if (reattachOrphanedJobs) {
+            await onLog("stdout", `[paperclip] Reattaching to orphaned Job ${orphanJobName} from prior server instance (task: ${taskId})...\n`);
+            activeJobs.set(orphanJobName, { namespace: guardNamespace, kubeconfigPath });
+            return streamAndAwaitJob(ctx, orphanJobName, guardNamespace, timeoutSec, graceSec, kubeconfigPath, retainJobs);
+          }
+          await onLog("stderr", `[paperclip] Orphaned Job ${orphanJobName} found for this task but reattachOrphanedJobs is disabled.\n`);
+          return {
+            exitCode: null,
+            signal: null,
+            timedOut: false,
+            errorMessage: `Orphaned Job ${orphanJobName} is still running (reattachOrphanedJobs disabled)`,
+            errorCode: "k8s_concurrent_run_blocked",
+          };
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await onLog("stderr", `[paperclip] Concurrency guard unreachable — cannot list Jobs: ${msg}\n`);
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        errorMessage: `Concurrency guard unreachable: ${msg}`,
+        errorCode: "k8s_concurrency_guard_unreachable",
+      };
+    }
 
   // Read agent instructions file (instructionsFilePath config field → system prompt prepend)
   const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
@@ -592,275 +987,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
   }
 
-  await onLog("stdout", `[paperclip] Created K8s Job: ${jobName} in namespace ${namespace} (deadline: ${timeoutSec > 0 ? `${timeoutSec}s` : "none"})\n`);
+    // Register job for SIGTERM cleanup before releasing the mutex.
+    activeJobs.set(jobName, { namespace, kubeconfigPath, promptSecretName });
 
-  let stdout = "";
-  let exitCode: number | null = null;
-  let jobTimedOut = false;
-  let podTerminatedReason: string | null = null;
-  let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+    await onLog("stdout", `[paperclip] Created K8s Job: ${jobName} in namespace ${namespace} (deadline: ${timeoutSec > 0 ? `${timeoutSec}s` : "none"})\n`);
 
-  try {
-    const scheduleTimeoutMs = 120_000;
-    let podName: string;
-    try {
-      podName = await waitForPod(namespace, jobName, scheduleTimeoutMs, onLog, kubeconfigPath);
-      await onLog("stdout", `[paperclip] Pod running: ${podName}\n`);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      await onLog("stderr", `[paperclip] Pod scheduling failed: ${msg}\n`);
-      return {
-        exitCode: null,
-        signal: null,
-        timedOut: false,
-        errorMessage: `Pod scheduling failed: ${msg}`,
-        errorCode: "k8s_pod_schedule_failed",
-      };
-    }
-
-    const completionTimeoutMs = timeoutSec > 0 ? (timeoutSec + graceSec) * 1000 : 0;
-
-    // Shared stop signal: set to true when job completion is detected so
-    // the log stream stops reconnecting promptly.
-    const logStopSignal = { stopped: false };
-    // Shared dedup filter across reconnects so replayed lines inside the
-    // sinceSeconds overlap window are dropped before reaching the UI.
-    const logDedup = new LogLineDedupFilter();
-
-    // Keepalive: periodically emit a status line so the Paperclip server
-    // knows the adapter is still alive during long silent phases.
-    let lastLogAt = Date.now();
-    let keepaliveJobTerminal = false;
-    let consecutiveTerminalReadings = 0;
-    keepaliveTimer = setInterval(() => {
-      void (async () => {
-        if (keepaliveJobTerminal) return;
-
-        // Require two consecutive terminal readings before latching to
-        // guard against a stale K8s API cache returning a false terminal
-        // status on a single read.
-        try {
-          const j = await getBatchApi(kubeconfigPath).readNamespacedJob({ name: jobName, namespace });
-          const terminal = j.status?.conditions?.some(
-            (c) => (c.type === "Complete" || c.type === "Failed") && c.status === "True",
-          );
-          if (terminal) {
-            consecutiveTerminalReadings++;
-            if (consecutiveTerminalReadings >= 2) keepaliveJobTerminal = true;
-            return;
-          }
-          consecutiveTerminalReadings = 0;
-        } catch {
-          return;
-        }
-
-        const silenceSec = Math.round((Date.now() - lastLogAt) / 1000);
-        void onLog("stdout", `[paperclip] keepalive — job ${jobName} running (${silenceSec}s since last output)\n`).catch(() => {});
-      })();
-    }, KEEPALIVE_INTERVAL_MS);
-
-    // wrappedOnLog updates lastLogAt so the keepalive timer can measure silence.
-    const wrappedOnLog: typeof onLog = async (stream, chunk) => {
-      lastLogAt = Date.now();
-      return onLog(stream, chunk);
-    };
-
-    // Track when the log stream first exits so the grace-period can fire
-    // if the K8s Job condition lags behind container exit.
-    let logExitTime: number | null = null;
-    const trackedLogStream = streamPodLogs(
-      namespace, podName, wrappedOnLog, kubeconfigPath, logStopSignal, logDedup,
-      () => { logExitTime = Date.now(); },
-    );
-
-    // completionGraced races waitForJobCompletion against a grace timer that
-    // fires LOG_EXIT_COMPLETION_GRACE_MS after the log stream exits. This bounds
-    // the stale-UI window when K8s Job conditions lag container exit.
-    let gracePoller: ReturnType<typeof setInterval> | null = null;
-    const completionGraced = new Promise<JobCompletionResult>((resolve, reject) => {
-      let settled = false;
-      const settleOk = (r: JobCompletionResult) => {
-        if (settled) return;
-        settled = true;
-        if (gracePoller) { clearInterval(gracePoller); gracePoller = null; }
-        logStopSignal.stopped = true;
-        resolve(r);
-      };
-      const settleErr = (err: unknown) => {
-        if (settled) return;
-        settled = true;
-        if (gracePoller) { clearInterval(gracePoller); gracePoller = null; }
-        logStopSignal.stopped = true;
-        reject(err);
-      };
-      waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath).then(settleOk).catch(settleErr);
-      gracePoller = setInterval(() => {
-        if (logExitTime !== null && Date.now() - logExitTime >= LOG_EXIT_COMPLETION_GRACE_MS) {
-          void onLog("stdout", `[paperclip] Log stream exited ${LOG_EXIT_COMPLETION_GRACE_MS / 1000}s ago without K8s Job condition update — proceeding with captured output\n`).catch(() => {});
-          settleOk({ succeeded: false, timedOut: false, jobGone: true });
-        }
-      }, 1_000);
-    });
-
-    const [logResult, completionResult] = await Promise.allSettled([
-      trackedLogStream,
-      completionGraced,
-    ]);
-
-    if (keepaliveTimer) {
-      clearInterval(keepaliveTimer);
-      keepaliveTimer = null;
-    }
-
-    if (logResult.status === "fulfilled") {
-      stdout = logResult.value;
-    }
-
-    if (!stdout.trim()) {
-      await onLog("stdout", `[paperclip] Log stream returned empty — reading pod logs directly...\n`);
-      stdout = await readPodLogs(namespace, podName, kubeconfigPath);
-      if (stdout.trim()) {
-        await onLog("stdout", stdout);
-      }
-    } else if (!parseOpenCodeJsonl(stdout).sessionId) {
-      // Stdout is non-empty but missing a valid session result — try one-shot fallback
-      await onLog("stdout", `[paperclip] Partial stdout missing session result — reading pod logs directly...\n`);
-      const fallbackLogs = await readPodLogs(namespace, podName, kubeconfigPath);
-      if (fallbackLogs.trim()) {
-        stdout = fallbackLogs;
-        await onLog("stdout", fallbackLogs);
-      }
-    }
-
-    if (completionResult.status === "fulfilled") {
-      const completion = completionResult.value;
-      jobTimedOut = completion.timedOut;
-      if (completion.jobGone) {
-        await onLog("stdout", `[paperclip] Job ${jobName} not found (likely TTL-cleaned after completion).\n`);
-      }
-    } else {
-      jobTimedOut = true;
-    }
-
-    const terminatedInfo = await getPodTerminatedInfo(namespace, jobName, kubeconfigPath);
-    exitCode = terminatedInfo.exitCode;
-    podTerminatedReason = terminatedInfo.reason;
+    // return evaluates streamAndAwaitJob() (creating the promise) before finally runs,
+    // so the mutex releases as soon as the job is registered — not after the full lifecycle.
+    return streamAndAwaitJob(ctx, jobName, namespace, timeoutSec, graceSec, kubeconfigPath, retainJobs, promptSecretName);
   } finally {
-    if (keepaliveTimer) {
-      clearInterval(keepaliveTimer);
-      keepaliveTimer = null;
-    }
-    if (!retainJobs) {
-      await cleanupJob(namespace, jobName, onLog, kubeconfigPath, promptSecretName);
-    } else {
-      await onLog("stdout", `[paperclip] Retaining job ${jobName} for debugging (retainJobs=true)\n`);
-    }
+    releaseLock();
   }
-
-  if (jobTimedOut) {
-    return {
-      exitCode,
-      signal: null,
-      timedOut: true,
-      errorMessage: `Timed out after ${timeoutSec}s`,
-      errorCode: "timeout",
-    };
-  }
-
-  // Parse OpenCode JSONL output
-  const parsed = parseOpenCodeJsonl(stdout);
-
-  const runtimeSessionParams = parseObject(runtime.sessionParams);
-  const fallbackSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
-  const workspaceContext = parseObject(ctx.context.paperclipWorkspace);
-  const workspaceId = asString(workspaceContext.workspaceId, "") || null;
-  const workspaceRepoUrl = asString(workspaceContext.repoUrl, "") || null;
-  const workspaceRepoRef = asString(workspaceContext.repoRef, "") || null;
-  const cwd = asString(workspaceContext.cwd, "");
-
-  const resolvedSessionId = parsed.sessionId ?? (fallbackSessionId || null);
-  const resolvedSessionParams = resolvedSessionId
-    ? {
-        sessionId: resolvedSessionId,
-        ...(cwd ? { cwd } : {}),
-        ...(workspaceId ? { workspaceId } : {}),
-        ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
-        ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
-      } as Record<string, unknown>
-    : null;
-
-  const provider = parseModelProvider(model);
-  const biller = inferOpenAiCompatibleBiller(process.env, null) ?? provider ?? "unknown";
-
-  const parsedError = typeof parsed.errorMessage === "string" ? parsed.errorMessage.trim() : "";
-  const rawExitCode = exitCode;
-  const synthesizedExitCode = parsedError && (rawExitCode ?? 0) === 0 ? 1 : rawExitCode;
-  const failed = (synthesizedExitCode ?? 0) !== 0;
-
-  // If the session was stale, clear it so the next heartbeat starts fresh
-  if (failed && isOpenCodeUnknownSessionError(stdout, parsedError)) {
-    await onLog("stdout", `[paperclip] OpenCode session is unavailable; clearing for next run.\n`);
-    return {
-      exitCode: synthesizedExitCode,
-      signal: null,
-      timedOut: false,
-      errorMessage: parsedError || "Session unavailable",
-      errorCode: "session_unavailable",
-      clearSession: true,
-      resultJson: { stdout },
-    };
-  }
-
-  // If OpenCode hit its step limit, clear the session so the next run starts fresh
-  // rather than resuming into an already-exhausted turn sequence.
-  const stepLimitReached = isOpenCodeStepLimitResult(stdout);
-  if (stepLimitReached) {
-    await onLog("stdout", `[paperclip] OpenCode step limit reached; clearing session for next run.\n`);
-  }
-
-  // Detect empty LLM response: session started but LLM returned no tokens or messages
-  const hasLlmOutput = parsed.usage.outputTokens > 0 || !!parsed.summary;
-  if (!jobTimedOut && parsed.sessionId !== null && !hasLlmOutput && !parsedError) {
-    await onLog("stderr", `[paperclip] LLM returned empty response (0 output tokens).\n`);
-    return {
-      exitCode: synthesizedExitCode ?? 1,
-      signal: null,
-      timedOut: false,
-      errorMessage: "LLM API returned empty response",
-      errorCode: "llm_api_error",
-      sessionId: resolvedSessionId,
-      sessionParams: resolvedSessionParams,
-      resultJson: { stdout },
-    };
-  }
-
-  const firstStderrLine = stdout.split(/\r?\n/).map((l) => l.trim()).find(Boolean) ?? "";
-  const podFailureDescription = podTerminatedReason
-    ? `Pod exited: ${podTerminatedReason}${synthesizedExitCode != null ? ` (exit ${synthesizedExitCode})` : ""}`
-    : null;
-  const errorParts = [parsedError, podFailureDescription].filter(Boolean);
-  const fallbackErrorMessage =
-    errorParts.join("; ") || firstStderrLine || `OpenCode exited with code ${synthesizedExitCode ?? -1}`;
-
-  return {
-    exitCode: synthesizedExitCode,
-    signal: null,
-    timedOut: false,
-    errorMessage: (synthesizedExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
-    usage: {
-      inputTokens: parsed.usage.inputTokens,
-      outputTokens: parsed.usage.outputTokens,
-      cachedInputTokens: parsed.usage.cachedInputTokens,
-    },
-    sessionId: resolvedSessionId,
-    sessionParams: resolvedSessionParams,
-    sessionDisplayId: resolvedSessionId,
-    provider,
-    model: model || null,
-    billingType: "unknown",
-    costUsd: parsed.costUsd,
-    resultJson: { stdout },
-    summary: parsed.summary,
-    clearSession: stepLimitReached,
-  } as AdapterExecutionResult;
 }
