@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import { execute } from "./execute.js";
-import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi } from "./k8s-client.js";
+import { execute, ensureAgentDbPvc } from "./execute.js";
+import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, getPvc, createPvc } from "./k8s-client.js";
 import { buildJobManifest } from "./job-manifest.js";
 
 vi.mock("./k8s-client.js", () => ({
@@ -1094,5 +1094,94 @@ describe("execute — large-prompt Secret path", () => {
 
     expect(vi.mocked(buildJobManifest)).toHaveBeenCalledTimes(1);
     expect(coreApi.createNamespacedSecret).not.toHaveBeenCalled();
+  });
+});
+
+describe("ensureAgentDbPvc — unit", () => {
+  const NAMESPACE = "test-ns";
+  const AGENT_ID = "agent-uuid-1234";
+  const EXPECTED_PVC_NAME = `opencode-db-${AGENT_ID}`;
+
+  it("returns null when agentDbMode is ephemeral", async () => {
+    const result = await ensureAgentDbPvc(AGENT_ID, NAMESPACE, { agentDbMode: "ephemeral" });
+    expect(result).toBeNull();
+    expect(vi.mocked(getPvc)).not.toHaveBeenCalled();
+    expect(vi.mocked(createPvc)).not.toHaveBeenCalled();
+  });
+
+  it("returns existing PVC claim name without calling createPvc", async () => {
+    vi.mocked(getPvc).mockResolvedValueOnce({ metadata: { name: EXPECTED_PVC_NAME } } as Awaited<ReturnType<typeof getPvc>>);
+
+    const result = await ensureAgentDbPvc(AGENT_ID, NAMESPACE, { agentDbMode: "dedicated_pvc", agentDbStorageClass: "standard" });
+
+    expect(result).toBe(EXPECTED_PVC_NAME);
+    expect(vi.mocked(getPvc)).toHaveBeenCalledWith(NAMESPACE, EXPECTED_PVC_NAME, undefined);
+    expect(vi.mocked(createPvc)).not.toHaveBeenCalled();
+  });
+
+  it("creates PVC and returns claim name when PVC does not exist", async () => {
+    vi.mocked(getPvc).mockResolvedValueOnce(null);
+    vi.mocked(createPvc).mockResolvedValueOnce({} as Awaited<ReturnType<typeof createPvc>>);
+
+    const result = await ensureAgentDbPvc(AGENT_ID, NAMESPACE, {
+      agentDbMode: "dedicated_pvc",
+      agentDbStorageClass: "standard",
+      agentDbStorageCapacity: "5Gi",
+    });
+
+    expect(result).toBe(EXPECTED_PVC_NAME);
+    expect(vi.mocked(createPvc)).toHaveBeenCalledWith(
+      NAMESPACE,
+      expect.objectContaining({
+        metadata: expect.objectContaining({ name: EXPECTED_PVC_NAME }),
+        spec: expect.objectContaining({
+          accessModes: ["ReadWriteOnce"],
+          storageClassName: "standard",
+          resources: { requests: { storage: "5Gi" } },
+        }),
+      }),
+      undefined,
+    );
+  });
+
+  it("defaults to 1Gi capacity when agentDbStorageCapacity is not set", async () => {
+    vi.mocked(getPvc).mockResolvedValueOnce(null);
+    vi.mocked(createPvc).mockResolvedValueOnce({} as Awaited<ReturnType<typeof createPvc>>);
+
+    await ensureAgentDbPvc(AGENT_ID, NAMESPACE, { agentDbMode: "dedicated_pvc", agentDbStorageClass: "fast" });
+
+    expect(vi.mocked(createPvc)).toHaveBeenCalledWith(
+      NAMESPACE,
+      expect.objectContaining({
+        spec: expect.objectContaining({ resources: { requests: { storage: "1Gi" } } }),
+      }),
+      undefined,
+    );
+  });
+
+  it("throws when agentDbStorageClass is missing and PVC does not exist", async () => {
+    vi.mocked(getPvc).mockResolvedValueOnce(null);
+
+    await expect(
+      ensureAgentDbPvc(AGENT_ID, NAMESPACE, { agentDbMode: "dedicated_pvc" }),
+    ).rejects.toThrow(/agentDbStorageClass/);
+    expect(vi.mocked(createPvc)).not.toHaveBeenCalled();
+  });
+
+  it("defaults to dedicated_pvc when agentDbMode is not set", async () => {
+    vi.mocked(getPvc).mockResolvedValueOnce({ metadata: { name: EXPECTED_PVC_NAME } } as Awaited<ReturnType<typeof getPvc>>);
+
+    const result = await ensureAgentDbPvc(AGENT_ID, NAMESPACE, {});
+    expect(result).toBe(EXPECTED_PVC_NAME);
+  });
+
+  it("derives PVC name from agent ID, keeping alphanumeric and hyphens", async () => {
+    const weirdAgentId = "Agent_ID/with+special@chars";
+    const expectedSlug = "agentidwithspecialchars"; // [^a-z0-9-] stripped
+    vi.mocked(getPvc).mockResolvedValueOnce({ metadata: { name: `opencode-db-${expectedSlug}` } } as Awaited<ReturnType<typeof getPvc>>);
+
+    const result = await ensureAgentDbPvc(weirdAgentId, NAMESPACE, { agentDbMode: "dedicated_pvc" });
+    expect(result).toBe(`opencode-db-${expectedSlug}`);
+    expect(vi.mocked(getPvc)).toHaveBeenCalledWith(NAMESPACE, `opencode-db-${expectedSlug}`, undefined);
   });
 });
