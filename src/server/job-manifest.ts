@@ -173,6 +173,12 @@ function buildEnvVars(
   if (selfPod.inheritedEnv.PAPERCLIP_API_URL) {
     paperclipEnv.PAPERCLIP_API_URL = selfPod.inheritedEnv.PAPERCLIP_API_URL;
   }
+  // Inherit PAPERCLIP_DEV_API_KEY if set (dev-instance key, distinct from the
+  // main-instance run JWT in PAPERCLIP_API_KEY). Used by the external cancel
+  // polling in execute.ts to authenticate against the dev Paperclip instance.
+  if (selfPod.inheritedEnv.PAPERCLIP_DEV_API_KEY) {
+    paperclipEnv.PAPERCLIP_DEV_API_KEY = selfPod.inheritedEnv.PAPERCLIP_DEV_API_KEY;
+  }
 
   // Layer 3: Inherited from Deployment (Bedrock, API keys, etc.)
   const merged: Record<string, string> = {

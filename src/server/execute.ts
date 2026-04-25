@@ -544,8 +544,11 @@ async function streamAndAwaitJob(
         await new Promise<void>((resolve) => setTimeout(resolve, KEEPALIVE_INTERVAL_MS));
         if (logStopSignal.stopped || cancelSignal.cancelled) break;
         try {
+          // Prefer PAPERCLIP_DEV_API_KEY if set (allows dev instance key to be
+          // distinct from the main-instance run JWT in PAPERCLIP_API_KEY).
+          const apiKey = process.env.PAPERCLIP_DEV_API_KEY ?? process.env.PAPERCLIP_API_KEY ?? "";
           const resp = await fetch(`${apiUrl}/api/issues/${issueId}`, {
-            headers: { Authorization: `Bearer ${process.env.PAPERCLIP_API_KEY ?? ""}` },
+            headers: { Authorization: `Bearer ${apiKey}` },
           });
           if (resp.ok) {
             const data = await resp.json() as { status?: string };
