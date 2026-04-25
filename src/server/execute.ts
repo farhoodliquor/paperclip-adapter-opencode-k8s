@@ -312,6 +312,42 @@ async function readPodLogs(
   }
 }
 
+/**
+ * Wait until the named pod's phase transitions to Succeeded, Failed, or Unknown,
+ * or until the pod is gone (404). Returns immediately if the pod is already in a
+ * terminal phase. Used as a pre-flight before readPodLogs when the K8s log stream
+ * returns empty while the container is still running (Node.js stdout buffering +
+ * the @kubernetes/client-node v1.x follow-stream known premature-close issue).
+ */
+async function waitForPodTermination(
+  namespace: string,
+  podName: string,
+  timeoutMs: number,
+  onLog: AdapterExecutionContext["onLog"],
+  kubeconfigPath?: string,
+): Promise<void> {
+  const coreApi = getCoreApi(kubeconfigPath);
+  const deadline = Date.now() + timeoutMs;
+  let notified = false;
+  while (Date.now() < deadline) {
+    try {
+      const pod = await coreApi.readNamespacedPod({ name: podName, namespace });
+      const phase = pod.status?.phase;
+      if (phase === "Succeeded" || phase === "Failed" || phase === "Unknown") return;
+      if (!notified) {
+        notified = true;
+        await onLog(
+          "stdout",
+          `[paperclip] Container still running — waiting up to ${Math.round(timeoutMs / 1000)}s for it to exit to capture output...\n`,
+        );
+      }
+    } catch {
+      return; // Pod gone (404) — nothing left to wait for
+    }
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+  }
+}
+
 export type JobCompletionResult = { succeeded: boolean; timedOut: boolean; jobGone: boolean };
 
 async function waitForJobCompletion(
@@ -572,6 +608,11 @@ async function streamAndAwaitJob(
 
     if (!stdout.trim()) {
       await onLog("stdout", `[paperclip] Log stream returned empty — reading pod logs directly...\n`);
+      // The K8s client v1.x has a known issue where follow-stream closes prematurely,
+      // causing the log stream to return empty even when the container is still running.
+      // Node.js also buffers stdout when writing to a pipe, so logs only flush on exit.
+      // Wait for the pod to actually terminate before attempting to read its final output.
+      await waitForPodTermination(namespace, podName, 120_000, onLog, kubeconfigPath);
       stdout = await readPodLogs(namespace, podName, kubeconfigPath);
       if (stdout.trim()) {
         await onLog("stdout", stdout);
