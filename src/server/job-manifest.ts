@@ -286,7 +286,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
 
   // Build opencode CLI args
   const opencodeArgs = ["run", "--format", "json"];
-  if (runtimeSessionId) opencodeArgs.push("--session", runtimeSessionId);
+  // resumeLastSession defaults to true (preserve existing behaviour); set to false to start fresh.
+  const resumeLastSession = asBoolean(config.resumeLastSession, true);
+  if (runtimeSessionId && resumeLastSession) opencodeArgs.push("--session", runtimeSessionId);
   if (model) opencodeArgs.push("--model", model);
   if (variant) opencodeArgs.push("--variant", variant);
   if (extraArgs.length > 0) opencodeArgs.push(...extraArgs);

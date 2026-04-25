@@ -16,6 +16,13 @@ vi.mock("./job-manifest.js", () => ({
   LARGE_PROMPT_THRESHOLD_BYTES: 256 * 1024,
 }));
 
+// Prevent skill loading from reading real SKILL.md files during tests — the
+// real filesystem read delays timer registration and breaks fake-timer tests.
+vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@paperclipai/adapter-utils/server-utils")>();
+  return { ...actual, readPaperclipRuntimeSkillEntries: vi.fn().mockResolvedValue([]) };
+});
+
 const MOCK_SELF_POD = {
   namespace: "test-ns",
   image: "test-image:latest",

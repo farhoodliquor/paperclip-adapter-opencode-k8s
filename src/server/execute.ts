@@ -2,6 +2,7 @@ import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclip
 import { inferOpenAiCompatibleBiller, redactHomePathUserSegments } from "@paperclipai/adapter-utils";
 import { asString, asNumber, asBoolean, parseObject, readPaperclipRuntimeSkillEntries, resolvePaperclipDesiredSkillNames } from "@paperclipai/adapter-utils/server-utils";
 import { readFile } from "node:fs/promises";
+import path from "node:path";
 import {
   parseOpenCodeJsonl,
   isOpenCodeUnknownSessionError,
@@ -928,14 +929,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let skillsBundleContent = "";
   try {
     const moduleDir = import.meta.dirname;
-    const availableEntries = await readPaperclipRuntimeSkillEntries(config, moduleDir);
+    // Add the standard Paperclip skills dir as an additional candidate — the relative
+    // candidates in adapter-utils don't resolve to the PVC-mounted skills home.
+    const paperclipSkillsHome = "/paperclip/.claude/skills";
+    const availableEntries = await readPaperclipRuntimeSkillEntries(config, moduleDir, [paperclipSkillsHome]);
     const desiredSkillKeys = resolvePaperclipDesiredSkillNames(config, availableEntries);
     const skillTexts: string[] = [];
     for (const key of desiredSkillKeys) {
       const entry = availableEntries.find((e) => e.key === key);
       if (entry?.source) {
         try {
-          const text = (await readFile(entry.source, "utf-8")).trim();
+          // entry.source from listPaperclipSkillEntries is a directory; read SKILL.md from it.
+          // Fall back to reading entry.source directly for file-based paperclipRuntimeSkills entries.
+          let text: string;
+          try {
+            text = (await readFile(path.join(entry.source, "SKILL.md"), "utf-8")).trim();
+          } catch {
+            text = (await readFile(entry.source, "utf-8")).trim();
+          }
           if (text) skillTexts.push(text);
         } catch {
           // skip unreadable skill files — non-fatal
