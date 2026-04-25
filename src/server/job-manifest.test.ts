@@ -287,16 +287,16 @@ describe("buildJobManifest", () => {
 });
 
 describe("agentDbClaimName — OPENCODE_DB env var", () => {
-  it("sets OPENCODE_DB to /opencode-db when agentDbClaimName is a string (dedicated PVC)", () => {
+  it("sets OPENCODE_DB to /opencode-db/opencode.db when agentDbClaimName is a string (dedicated PVC)", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, agentDbClaimName: "opencode-db-agent-abc" });
     const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
-    expect(env.find((e) => e.name === "OPENCODE_DB")?.value).toBe("/opencode-db");
+    expect(env.find((e) => e.name === "OPENCODE_DB")?.value).toBe("/opencode-db/opencode.db");
   });
 
-  it("sets OPENCODE_DB to /opencode-db when agentDbClaimName is null (ephemeral)", () => {
+  it("sets OPENCODE_DB to /opencode-db/opencode.db when agentDbClaimName is null (ephemeral)", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, agentDbClaimName: null });
     const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
-    expect(env.find((e) => e.name === "OPENCODE_DB")?.value).toBe("/opencode-db");
+    expect(env.find((e) => e.name === "OPENCODE_DB")?.value).toBe("/opencode-db/opencode.db");
   });
 
   it("does not set OPENCODE_DB when agentDbClaimName is undefined", () => {
@@ -305,13 +305,13 @@ describe("agentDbClaimName — OPENCODE_DB env var", () => {
     expect(env.find((e) => e.name === "OPENCODE_DB")).toBeUndefined();
   });
 
-  it("replaces a user-provided OPENCODE_DB env override with /opencode-db", () => {
+  it("replaces a user-provided OPENCODE_DB env override with /opencode-db/opencode.db", () => {
     const selfPod = { ...mockSelfPod, inheritedEnv: { OPENCODE_DB: "/user/override" } };
     const result = buildJobManifest({ ctx: mockCtx, selfPod, agentDbClaimName: "opencode-db-agent-abc" });
     const env = result.job.spec?.template?.spec?.containers?.[0].env ?? [];
     const dbEntries = env.filter((e) => e.name === "OPENCODE_DB");
     expect(dbEntries).toHaveLength(1);
-    expect(dbEntries[0].value).toBe("/opencode-db");
+    expect(dbEntries[0].value).toBe("/opencode-db/opencode.db");
   });
 });
 

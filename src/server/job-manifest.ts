@@ -312,9 +312,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   if (input.agentDbClaimName !== undefined) {
     const dbEnvIdx = envVars.findIndex((e) => e.name === "OPENCODE_DB");
     if (dbEnvIdx >= 0) {
-      envVars[dbEnvIdx] = { name: "OPENCODE_DB", value: "/opencode-db" };
+      envVars[dbEnvIdx] = { name: "OPENCODE_DB", value: "/opencode-db/opencode.db" };
     } else {
-      envVars.push({ name: "OPENCODE_DB", value: "/opencode-db" });
+      envVars.push({ name: "OPENCODE_DB", value: "/opencode-db/opencode.db" });
     }
   }
 
