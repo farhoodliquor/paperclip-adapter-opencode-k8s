@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import type * as k8s from "@kubernetes/client-node";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import {
@@ -80,8 +81,25 @@ function parseKeyValueOrObject(value: unknown): Record<string, string> {
   return result;
 }
 
-function sanitizeForK8sName(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 8);
+function sanitizeForK8sName(value: string, maxLen = 16): string {
+  return value.toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, maxLen);
+}
+
+/**
+ * Strips chars outside [a-z0-9._-], lowercases, truncates to 63 chars (K8s label value limit).
+ * Emits a stderr warning via `warn` when chars are dropped.
+ */
+export function sanitizeLabelValue(value: string, warn?: (msg: string) => void): string {
+  const lower = value.toLowerCase();
+  const sanitized = lower.replace(/[^a-z0-9._-]/g, "").slice(0, 63);
+  if (warn && sanitized !== lower.slice(0, 63)) {
+    warn(`[paperclip] sanitizeLabelValue: dropped chars from "${value}" -> "${sanitized}"\n`);
+  }
+  return sanitized;
+}
+
+function nameHash(...parts: string[]): string {
+  return createHash("sha256").update(parts.join(":")).digest("hex").slice(0, 6);
 }
 
 function buildEnvVars(
@@ -193,7 +211,8 @@ function buildRuntimeConfigJson(config: Record<string, unknown>): string | null 
 
 export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const { ctx, selfPod } = input;
-  const { runId, agent, runtime, config: rawConfig, context } = ctx;
+  const { runId, agent, runtime, config: rawConfig, context, onLog } = ctx;
+  const warnLabel = (msg: string) => void onLog("stderr", msg).catch(() => {});
   const config = parseObject(rawConfig);
 
   const namespace = asString(config.namespace, "") || selfPod.namespace;
@@ -214,10 +233,11 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const configuredCwd = asString(config.cwd, "");
   const workingDir = workspaceCwd || configuredCwd || "/paperclip";
 
-  // Job naming
+  // Job naming: slug + 6-char hash for collision resistance; strip trailing hyphens
   const agentSlug = sanitizeForK8sName(agent.id);
   const runSlug = sanitizeForK8sName(runId);
-  const jobName = `agent-opencode-${agentSlug}-${runSlug}`;
+  const hash = nameHash(agent.id, runId);
+  const jobName = `agent-opencode-${agentSlug}-${runSlug}-${hash}`.replace(/-+$/, "");
 
   // Build prompt
   const promptTemplate = asString(
@@ -291,17 +311,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     },
   };
 
-  // Labels
+  // Labels: sanitize all values to [a-z0-9._-] max 63 chars (K8s RFC 1123)
   const labels: Record<string, string> = {
     "app.kubernetes.io/managed-by": "paperclip",
     "app.kubernetes.io/component": "agent-job",
-    "paperclip.io/agent-id": agent.id,
-    "paperclip.io/run-id": runId,
-    "paperclip.io/company-id": agent.companyId,
+    "paperclip.io/agent-id": sanitizeLabelValue(agent.id, warnLabel),
+    "paperclip.io/run-id": sanitizeLabelValue(runId, warnLabel),
+    "paperclip.io/company-id": sanitizeLabelValue(agent.companyId, warnLabel),
     "paperclip.io/adapter-type": "opencode_k8s",
   };
   for (const [key, value] of Object.entries(extraLabels)) {
-    if (typeof value === "string") labels[key] = value;
+    if (typeof value === "string") labels[key] = sanitizeLabelValue(value, warnLabel);
   }
 
   // Volumes

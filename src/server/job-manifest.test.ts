@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildJobManifest, type JobBuildInput } from "./job-manifest.js";
+import { buildJobManifest, sanitizeLabelValue, type JobBuildInput } from "./job-manifest.js";
 
 const mockSelfPod: JobBuildInput["selfPod"] = {
   namespace: "paperclip",
@@ -194,5 +194,99 @@ describe("buildJobManifest", () => {
 
     const container = result.job.spec?.template?.spec?.containers?.[0];
     expect(container?.envFrom).toBeUndefined();
+  });
+
+  it("job name includes 6-char hash suffix", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+
+    // format: agent-opencode-{agentSlug}-{runSlug}-{6hexchars}
+    expect(result.jobName).toMatch(/^agent-opencode-[a-z0-9-]+-[a-f0-9]{6}$/);
+  });
+
+  it("job name has no trailing hyphens even when slug sanitization creates them", () => {
+    const ctx = {
+      ...mockCtx,
+      agent: { ...mockCtx.agent, id: "agent---" },
+      runId: "run---",
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+
+    expect(result.jobName).not.toMatch(/-$/);
+  });
+
+  it("label values are sanitized to [a-z0-9._-]", () => {
+    const ctx = {
+      ...mockCtx,
+      agent: { ...mockCtx.agent, id: "Agent_ID/123", companyId: "Co:456" },
+      runId: "Run@789",
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+
+    const labels = result.job.metadata?.labels ?? {};
+    expect(labels["paperclip.io/agent-id"]).toMatch(/^[a-z0-9._-]*$/);
+    expect(labels["paperclip.io/run-id"]).toMatch(/^[a-z0-9._-]*$/);
+    expect(labels["paperclip.io/company-id"]).toMatch(/^[a-z0-9._-]*$/);
+  });
+
+  it("same agent+run always produces the same job name (deterministic hash)", () => {
+    const r1 = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+    const r2 = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+
+    expect(r1.jobName).toBe(r2.jobName);
+  });
+
+  it("different runIds produce different job names", () => {
+    const ctx2 = { ...mockCtx, runId: "run-different-999" };
+    const r1 = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+    const r2 = buildJobManifest({ ctx: ctx2, selfPod: mockSelfPod });
+
+    expect(r1.jobName).not.toBe(r2.jobName);
+  });
+});
+
+describe("sanitizeLabelValue", () => {
+  it("passes through clean values unchanged", () => {
+    expect(sanitizeLabelValue("abc-123")).toBe("abc-123");
+    expect(sanitizeLabelValue("foo.bar_baz")).toBe("foo.bar_baz");
+  });
+
+  it("lowercases uppercase letters", () => {
+    expect(sanitizeLabelValue("MyAgent")).toBe("myagent");
+  });
+
+  it("strips chars outside [a-z0-9._-]", () => {
+    expect(sanitizeLabelValue("agent/id:test@v1")).toBe("agentidtestv1");
+  });
+
+  it("truncates to 63 chars", () => {
+    const long = "a".repeat(80);
+    expect(sanitizeLabelValue(long)).toHaveLength(63);
+  });
+
+  it("calls warn when chars are dropped", () => {
+    const warned: string[] = [];
+    sanitizeLabelValue("agent/id", (msg) => warned.push(msg));
+    expect(warned.length).toBe(1);
+    expect(warned[0]).toContain("agent/id");
+  });
+
+  it("does not call warn when nothing is dropped", () => {
+    const warned: string[] = [];
+    sanitizeLabelValue("clean-value.123", (msg) => warned.push(msg));
+    expect(warned.length).toBe(0);
+  });
+
+  it("does not call warn when the only change is truncation to exactly 63", () => {
+    const warned: string[] = [];
+    // 63 chars all lowercase clean — no warn expected
+    sanitizeLabelValue("a".repeat(63), (msg) => warned.push(msg));
+    expect(warned.length).toBe(0);
+  });
+
+  it("calls warn when value contains invalid chars even if truncated result looks clean", () => {
+    const warned: string[] = [];
+    // 'a/b' repeated — '/' is stripped, so sanitized differs from lower.slice(0,63)
+    sanitizeLabelValue("a/b".repeat(25), (msg) => warned.push(msg));
+    expect(warned.length).toBe(1);
   });
 });
