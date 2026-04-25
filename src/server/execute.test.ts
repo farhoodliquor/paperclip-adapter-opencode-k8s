@@ -1185,3 +1185,30 @@ describe("ensureAgentDbPvc — unit", () => {
     expect(vi.mocked(getPvc)).toHaveBeenCalledWith(NAMESPACE, `opencode-db-${expectedSlug}`, undefined);
   });
 });
+
+describe("isK8s404", () => {
+  it("recognizes @kubernetes/client-node v1.x ApiException with code=404", async () => {
+    const { isK8s404 } = await import("./execute.js");
+    const err = Object.assign(new Error("not found"), { code: 404 });
+    expect(isK8s404(err)).toBe(true);
+  });
+
+  it("still recognizes legacy errors with statusCode=404", async () => {
+    const { isK8s404 } = await import("./execute.js");
+    const err = Object.assign(new Error("not found"), { statusCode: 404 });
+    expect(isK8s404(err)).toBe(true);
+  });
+
+  it("still recognizes errors with response.statusCode=404", async () => {
+    const { isK8s404 } = await import("./execute.js");
+    const err = Object.assign(new Error("not found"), { response: { statusCode: 404 } });
+    expect(isK8s404(err)).toBe(true);
+  });
+
+  it("returns false for non-404 errors", async () => {
+    const { isK8s404 } = await import("./execute.js");
+    expect(isK8s404(Object.assign(new Error("server error"), { code: 500 }))).toBe(false);
+    expect(isK8s404(new Error("plain error"))).toBe(false);
+    expect(isK8s404(null)).toBe(false);
+  });
+});

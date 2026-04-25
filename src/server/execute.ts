@@ -29,6 +29,8 @@ const LOG_EXIT_COMPLETION_GRACE_MS = parseInt(process.env.LOG_EXIT_COMPLETION_GR
 export function isK8s404(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   const asAny = err as unknown as Record<string, unknown>;
+  // @kubernetes/client-node v1.x ApiException exposes HTTP status as `code`.
+  if (typeof asAny.code === "number" && asAny.code === 404) return true;
   if (typeof asAny.statusCode === "number" && asAny.statusCode === 404) return true;
   const resp = asAny.response as Record<string, unknown> | undefined;
   if (typeof resp?.statusCode === "number" && resp.statusCode === 404) return true;

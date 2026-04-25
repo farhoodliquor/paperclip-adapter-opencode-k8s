@@ -178,6 +178,8 @@ export function resetCache(): void {
 function isNotFound(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   const asAny = err as unknown as Record<string, unknown>;
+  // @kubernetes/client-node v1.x ApiException exposes HTTP status as `code`.
+  if (typeof asAny.code === "number" && asAny.code === 404) return true;
   if (typeof asAny.statusCode === "number" && asAny.statusCode === 404) return true;
   const resp = asAny.response as Record<string, unknown> | undefined;
   return typeof resp?.statusCode === "number" && resp.statusCode === 404;
