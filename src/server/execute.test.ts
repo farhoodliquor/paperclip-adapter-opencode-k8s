@@ -879,11 +879,16 @@ describe("execute — log dedup (waitForPod status dedup)", () => {
 describe("execute — external cancel polling", () => {
   const KEEPALIVE_MS = 15_000;
 
+  beforeEach(() => {
+    process.env.PAPERCLIP_DEV_API_KEY = "test-key";
+  });
+
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
     delete process.env.PAPERCLIP_API_URL;
     delete process.env.PAPERCLIP_API_KEY;
+    delete process.env.PAPERCLIP_DEV_API_KEY;
   });
 
   it("returns errorCode=cancelled and deletes job when issue status is cancelled", async () => {
