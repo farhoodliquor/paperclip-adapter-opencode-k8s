@@ -320,6 +320,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     "paperclip.io/company-id": sanitizeLabelValue(agent.companyId, warnLabel),
     "paperclip.io/adapter-type": "opencode_k8s",
   };
+  const taskId = asString(context.taskId ?? context.issueId, "").trim();
+  if (taskId) labels["paperclip.io/task-id"] = sanitizeLabelValue(taskId, warnLabel);
+  if (runtimeSessionId) labels["paperclip.io/session-id"] = sanitizeLabelValue(runtimeSessionId, warnLabel);
   for (const [key, value] of Object.entries(extraLabels)) {
     if (typeof value === "string") labels[key] = sanitizeLabelValue(value, warnLabel);
   }

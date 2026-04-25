@@ -70,6 +70,48 @@ describe("buildJobManifest", () => {
     expect(result.job.metadata?.labels?.["paperclip.io/run-id"]).toBe("run123456");
   });
 
+  it("sets paperclip.io/task-id label when context.taskId is present", () => {
+    const ctx = {
+      ...mockCtx,
+      context: { ...mockCtx.context, taskId: "7e0829c0-cbf7-4652-9554-4d777ce84bff" },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+
+    expect(result.job.metadata?.labels?.["paperclip.io/task-id"]).toBe("7e0829c0-cbf7-4652-9554-4d777ce84bff");
+  });
+
+  it("falls back to context.issueId for paperclip.io/task-id when taskId is null", () => {
+    const ctx = {
+      ...mockCtx,
+      context: { ...mockCtx.context, taskId: null, issueId: "issue-uuid-xyz" },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+
+    expect(result.job.metadata?.labels?.["paperclip.io/task-id"]).toBe("issue-uuid-xyz");
+  });
+
+  it("omits paperclip.io/task-id label when context.taskId and issueId are both null", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+
+    expect(result.job.metadata?.labels?.["paperclip.io/task-id"]).toBeUndefined();
+  });
+
+  it("sets paperclip.io/session-id label when runtime.sessionParams.sessionId is present", () => {
+    const ctx = {
+      ...mockCtx,
+      runtime: { ...mockCtx.runtime, sessionParams: { sessionId: "ses_abc123" } },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+
+    expect(result.job.metadata?.labels?.["paperclip.io/session-id"]).toBe("ses_abc123");
+  });
+
+  it("omits paperclip.io/session-id label when no session exists", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+
+    expect(result.job.metadata?.labels?.["paperclip.io/session-id"]).toBeUndefined();
+  });
+
   it("creates init container for prompt", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
 

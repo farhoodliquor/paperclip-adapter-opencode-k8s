@@ -125,6 +125,14 @@ export function getConfigSchema(): AdapterConfigSchema {
         hint: "Skip cleanup on completion for debugging",
         group: "Kubernetes",
       },
+      {
+        key: "reattachOrphanedJobs",
+        label: "Reattach Orphaned Jobs",
+        type: "toggle",
+        default: false,
+        hint: "When a running Job for the same task is found after a server restart, reattach (stream logs and await completion) instead of blocking",
+        group: "Kubernetes",
+      },
 
       // Operational fields (timeoutSec and graceSec are provided by the platform)
     ],
