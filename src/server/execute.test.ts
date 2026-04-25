@@ -1212,3 +1212,379 @@ describe("isK8s404", () => {
     expect(isK8s404(null)).toBe(false);
   });
 });
+
+describe("parseModelProvider", () => {
+  it("returns null for null input", async () => {
+    const { parseModelProvider } = await import("./execute.js");
+    expect(parseModelProvider(null)).toBeNull();
+  });
+
+  it("returns null when model has no slash separator", async () => {
+    const { parseModelProvider } = await import("./execute.js");
+    expect(parseModelProvider("gpt-4")).toBeNull();
+    expect(parseModelProvider("  ")).toBeNull();
+  });
+
+  it("returns the provider segment from a slash-separated model id", async () => {
+    const { parseModelProvider } = await import("./execute.js");
+    expect(parseModelProvider("anthropic/claude-opus-4")).toBe("anthropic");
+    expect(parseModelProvider("openai/gpt-4o")).toBe("openai");
+  });
+
+  it("trims whitespace inside the provider segment", async () => {
+    const { parseModelProvider } = await import("./execute.js");
+    expect(parseModelProvider("  bedrock  /claude")).toBe("bedrock");
+  });
+
+  it("returns null when provider segment is whitespace only", async () => {
+    const { parseModelProvider } = await import("./execute.js");
+    expect(parseModelProvider(" /model")).toBeNull();
+  });
+});
+
+describe("completionWithGrace", () => {
+  it("returns the completion result when it resolves before grace expires", async () => {
+    const { completionWithGrace } = await import("./execute.js");
+    const result = await completionWithGrace(
+      Promise.resolve({ succeeded: true, timedOut: false, jobGone: false }),
+      1000,
+    );
+    expect(result).toEqual({ succeeded: true, timedOut: false, jobGone: false });
+  });
+
+  it("returns timedOut result when grace expires first", async () => {
+    const { completionWithGrace } = await import("./execute.js");
+    vi.useFakeTimers();
+    try {
+      const slowCompletion = new Promise<{ succeeded: boolean; timedOut: boolean; jobGone: boolean }>(() => {});
+      const racePromise = completionWithGrace(slowCompletion, 50);
+      await vi.advanceTimersByTimeAsync(60);
+      const result = await racePromise;
+      expect(result).toEqual({ succeeded: false, timedOut: true, jobGone: false });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns timedOut result when completion promise rejects", async () => {
+    const { completionWithGrace } = await import("./execute.js");
+    const result = await completionWithGrace(Promise.reject(new Error("boom")), 1000);
+    expect(result).toEqual({ succeeded: false, timedOut: true, jobGone: false });
+  });
+});
+
+describe("execute — config edge paths", () => {
+  it("logs a warning but continues when instructionsFilePath cannot be read", async () => {
+    const ctx = makeCtx({ instructionsFilePath: "/does/not/exist/AGENTS.md" });
+    const result = await execute(ctx);
+    expect(result.errorCode).toBeUndefined();
+    const logCalls = vi.mocked(ctx.onLog).mock.calls;
+    const warning = logCalls.find(([_kind, msg]: [string, string]) => typeof msg === "string" && msg.includes("instructionsFilePath not readable"));
+    expect(warning).toBeDefined();
+  });
+
+  it("returns k8s_job_create_failed when ensureAgentDbPvc throws (PVC create rejected)", async () => {
+    vi.mocked(getPvc).mockResolvedValueOnce(null);
+    vi.mocked(createPvc).mockRejectedValueOnce(new Error("storage class missing"));
+    const ctx = makeCtx({
+      agentDbMode: "dedicated_pvc",
+      agentDbStorageClass: "fast",
+    });
+    const result = await execute(ctx);
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+    expect(result.errorMessage).toContain("storage class missing");
+  });
+
+  it("returns k8s_job_create_failed when ensureAgentDbPvc throws because storage class is missing", async () => {
+    vi.mocked(getPvc).mockResolvedValueOnce(null);
+    const ctx = makeCtx({ agentDbMode: "dedicated_pvc" });
+    const result = await execute(ctx);
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+    expect(result.errorMessage).toContain("agentDbStorageClass is required");
+  });
+});
+
+describe("execute — large-prompt Secret create failure", () => {
+  const LARGE_PROMPT = "y".repeat(300 * 1024);
+
+  it("returns k8s_job_create_failed when createNamespacedSecret throws", async () => {
+    vi.mocked(buildJobManifest).mockReturnValue({
+      job: MOCK_JOB as ReturnType<typeof buildJobManifest>["job"],
+      jobName: JOB_NAME,
+      namespace: NAMESPACE,
+      prompt: LARGE_PROMPT,
+      opencodeArgs: [],
+      promptMetrics: null,
+    } as unknown as ReturnType<typeof buildJobManifest>);
+
+    const coreApi = makeCoreApi();
+    coreApi.createNamespacedSecret.mockRejectedValue(new Error("etcd full"));
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+
+    const ctx = makeCtx();
+    const result = await execute(ctx);
+
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+    expect(result.errorMessage).toContain("Failed to create prompt Secret");
+    expect(result.errorMessage).toContain("etcd full");
+  });
+});
+
+describe("ensureAgentDbPvc — verification failure (FAR-85 belt-and-suspenders)", () => {
+  it("throws when getPvc returns null after createPvc resolved (verification failed)", async () => {
+    vi.mocked(getPvc)
+      .mockResolvedValueOnce(null)   // first existence check: not found
+      .mockResolvedValueOnce(null);  // post-create verification: still not found
+    vi.mocked(createPvc).mockResolvedValueOnce({} as never);
+    await expect(
+      ensureAgentDbPvc("agent-x", "ns-x", { agentDbMode: "dedicated_pvc", agentDbStorageClass: "fast" }),
+    ).rejects.toThrow(/PVC opencode-db-agent-x was not created/);
+  });
+});
+
+describe("execute — step limit detection", () => {
+  it("logs that the step limit was reached when a step_finish event has reason=max_steps", async () => {
+    const STEP_LIMIT_JSONL = [
+      JSON.stringify({ type: "text", part: { text: "partial" }, sessionID: "ses_step" }),
+      JSON.stringify({ type: "step_finish", part: { reason: "max_steps", tokens: { input: 10, output: 5 }, cost: 0 } }),
+    ].join("\n");
+
+    const coreApi = makeCoreApi(STEP_LIMIT_JSONL, 0);
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+
+    const ctx = makeCtx();
+    await execute(ctx);
+
+    const logCalls = vi.mocked(ctx.onLog).mock.calls;
+    const limitLog = logCalls.find(
+      ([_kind, msg]: [string, string]) => typeof msg === "string" && msg.includes("step limit reached"),
+    );
+    expect(limitLog).toBeDefined();
+  });
+});
+
+describe("execute — waitForPod 'no pod yet' messaging", () => {
+  it("emits a 'Waiting for Job controller to create pod' log when pod is not yet present", async () => {
+    const coreApi = makeCoreApi();
+    // First listNamespacedPod call returns empty (no pod yet), second returns Running
+    coreApi.listNamespacedPod = vi.fn()
+      .mockResolvedValueOnce({ items: [] })
+      .mockResolvedValueOnce({
+        items: [{ metadata: { name: POD_NAME }, status: { phase: "Running" } }],
+      })
+      .mockResolvedValue({
+        items: [{ status: { containerStatuses: [{ name: "opencode", state: { terminated: { exitCode: 0 } } }] } }],
+      });
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+
+    const ctx = makeCtx();
+    await execute(ctx);
+
+    const logCalls = vi.mocked(ctx.onLog).mock.calls;
+    const waitLog = logCalls.find(
+      ([_kind, msg]: [string, string]) => typeof msg === "string" && msg.includes("Waiting for Job controller to create pod"),
+    );
+    expect(waitLog).toBeDefined();
+  });
+});
+
+describe("execute — pod scheduling failure (extra paths)", () => {
+  it("returns k8s_pod_schedule_failed when init container is in ImagePullBackOff", async () => {
+    const coreApi = {
+      listNamespacedPod: vi.fn().mockResolvedValue({
+        items: [
+          {
+            metadata: { name: POD_NAME },
+            status: {
+              phase: "Pending",
+              initContainerStatuses: [
+                { name: "write-prompt", state: { waiting: { reason: "ImagePullBackOff", message: "back-off" } } },
+              ],
+            },
+          },
+        ],
+      }),
+      readNamespacedPodLog: vi.fn().mockResolvedValue(""),
+    };
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+    const result = await execute(makeCtx());
+    expect(result.errorCode).toBe("k8s_pod_schedule_failed");
+    expect(result.errorMessage).toMatch(/Init container.*image pull failed/);
+  });
+
+  it("returns k8s_pod_schedule_failed when init container is in CrashLoopBackOff", async () => {
+    const coreApi = {
+      listNamespacedPod: vi.fn().mockResolvedValue({
+        items: [
+          {
+            metadata: { name: POD_NAME },
+            status: {
+              phase: "Pending",
+              initContainerStatuses: [
+                { name: "write-prompt", state: { waiting: { reason: "CrashLoopBackOff", message: "loop" } } },
+              ],
+            },
+          },
+        ],
+      }),
+      readNamespacedPodLog: vi.fn().mockResolvedValue(""),
+    };
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+    const result = await execute(makeCtx());
+    expect(result.errorCode).toBe("k8s_pod_schedule_failed");
+    expect(result.errorMessage).toMatch(/Init container.*crash loop/);
+  });
+
+  it("returns k8s_pod_schedule_failed when main container is in CrashLoopBackOff", async () => {
+    const coreApi = {
+      listNamespacedPod: vi.fn().mockResolvedValue({
+        items: [
+          {
+            metadata: { name: POD_NAME },
+            status: {
+              phase: "Pending",
+              containerStatuses: [
+                { name: "opencode", state: { waiting: { reason: "CrashLoopBackOff", message: "loop" } } },
+              ],
+            },
+          },
+        ],
+      }),
+      readNamespacedPodLog: vi.fn().mockResolvedValue(""),
+    };
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+    const result = await execute(makeCtx());
+    expect(result.errorCode).toBe("k8s_pod_schedule_failed");
+    expect(result.errorMessage).toMatch(/crash loop/);
+  });
+
+  it("proceeds when all init containers terminated successfully and main is running", async () => {
+    const coreApi = {
+      listNamespacedPod: vi.fn()
+        .mockResolvedValueOnce({
+          items: [
+            {
+              metadata: { name: POD_NAME },
+              status: {
+                phase: "Pending",
+                initContainerStatuses: [
+                  { name: "write-prompt", state: { terminated: { exitCode: 0 } } },
+                ],
+                containerStatuses: [{ name: "opencode", state: { running: {} } }],
+              },
+            },
+          ],
+        })
+        .mockResolvedValue({
+          items: [{ status: { containerStatuses: [{ name: "opencode", state: { terminated: { exitCode: 0 } } }] } }],
+        }),
+      readNamespacedPodLog: vi.fn().mockResolvedValue(HAPPY_JSONL),
+    };
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+    const result = await execute(makeCtx());
+    expect(result.errorCode).toBeUndefined();
+    expect(result.exitCode).toBe(0);
+  });
+});
+
+describe("execute — skill bundle source loading", () => {
+  it("reads SKILL.md from entry.source dir and bundles content into the prompt", async () => {
+    const { mkdtempSync, writeFileSync, mkdirSync } = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "skills-test-"));
+    const skillDir = path.join(tmpDir, "skill-a");
+    mkdirSync(skillDir);
+    writeFileSync(path.join(skillDir, "SKILL.md"), "skill A content");
+
+    const utils = await import("@paperclipai/adapter-utils/server-utils");
+    vi.mocked(utils.readPaperclipRuntimeSkillEntries).mockResolvedValueOnce([
+      { key: "paperclip/skill-a", runtimeName: "skill-a", source: skillDir, required: true } as never,
+    ]);
+
+    const ctx = makeCtx();
+    await execute(ctx);
+
+    // buildJobManifest should have received the skills bundle content
+    const buildArgs = vi.mocked(buildJobManifest).mock.calls[0][0];
+    expect(buildArgs.skillsBundleContent).toContain("skill A content");
+  });
+
+  it("falls back to reading entry.source as a file when SKILL.md path read throws", async () => {
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "skills-flat-"));
+    const skillFile = path.join(tmpDir, "skill-b.md");
+    writeFileSync(skillFile, "skill B flat content");
+
+    const utils = await import("@paperclipai/adapter-utils/server-utils");
+    vi.mocked(utils.readPaperclipRuntimeSkillEntries).mockResolvedValueOnce([
+      { key: "paperclip/skill-b", runtimeName: "skill-b", source: skillFile, required: true } as never,
+    ]);
+
+    const ctx = makeCtx();
+    await execute(ctx);
+
+    const buildArgs = vi.mocked(buildJobManifest).mock.calls[0][0];
+    expect(buildArgs.skillsBundleContent).toContain("skill B flat content");
+  });
+});
+
+describe("execute — SIGTERM handler body (FAR-86 coverage)", () => {
+  it("invoking the captured SIGTERM handler deletes tracked Jobs and Secrets", async () => {
+    // Force a fresh module so sigtermHandlerInstalled starts false again.
+    vi.resetModules();
+    vi.doMock("./k8s-client.js", () => ({
+      getSelfPodInfo: vi.fn().mockResolvedValue(MOCK_SELF_POD),
+      getBatchApi: vi.fn(),
+      getCoreApi: vi.fn(),
+      getLogApi: vi.fn(),
+      getPvc: vi.fn().mockResolvedValue({ metadata: { name: "opencode-db-x" } }),
+      createPvc: vi.fn().mockResolvedValue({}),
+    }));
+    vi.doMock("./job-manifest.js", () => ({
+      buildJobManifest: vi.fn().mockReturnValue({
+        job: MOCK_JOB,
+        jobName: "fresh-job",
+        namespace: NAMESPACE,
+        prompt: "p",
+        opencodeArgs: [],
+        promptMetrics: null,
+      }),
+      LARGE_PROMPT_THRESHOLD_BYTES: 256 * 1024,
+    }));
+
+    const fresh = await import("./execute.js");
+    const k8s = await import("./k8s-client.js");
+    const batchApi = makeBatchApi();
+    const coreApi = makeCoreApi();
+    const logApi = makeLogApi();
+    vi.mocked(k8s.getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof k8s.getBatchApi>);
+    vi.mocked(k8s.getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof k8s.getCoreApi>);
+    vi.mocked(k8s.getLogApi).mockReturnValue(logApi as unknown as ReturnType<typeof k8s.getLogApi>);
+
+    let capturedHandler: (() => void) | null = null;
+    const onceSpy = vi.spyOn(process, "once").mockImplementation(
+      (event: string | symbol, handler: (...args: unknown[]) => void) => {
+        if (event === "SIGTERM") capturedHandler = handler as () => void;
+        return process;
+      },
+    );
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {}) as never);
+
+    await fresh.execute(makeCtx());
+    onceSpy.mockRestore();
+
+    expect(capturedHandler).not.toBeNull();
+    (capturedHandler as unknown as () => void)();
+    // Wait long enough for the async handler body to settle
+    await new Promise((r) => setTimeout(r, 50));
+    expect(batchApi.deleteNamespacedJob).toHaveBeenCalled();
+    expect(exitSpy).toHaveBeenCalled();
+
+    exitSpy.mockRestore();
+    vi.doUnmock("./k8s-client.js");
+    vi.doUnmock("./job-manifest.js");
+  });
+});

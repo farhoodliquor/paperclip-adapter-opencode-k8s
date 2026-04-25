@@ -182,3 +182,45 @@ describe("isOpenCodeUnknownSessionError", () => {
     expect(isOpenCodeUnknownSessionError(stdout, "")).toBe(true);
   });
 });
+
+describe("parseOpenCodeJsonl — errorText fallback paths", () => {
+  it("uses nested data.message when top-level message is missing", () => {
+    const stdout = JSON.stringify({
+      type: "error",
+      error: { data: { message: "nested issue" } },
+      sessionID: "ses_x",
+    });
+    const result = parseOpenCodeJsonl(stdout);
+    expect(result.errorMessage).toContain("nested issue");
+  });
+
+  it("uses error.name when no message or nested message", () => {
+    const stdout = JSON.stringify({
+      type: "error",
+      error: { name: "ProviderAuthError" },
+      sessionID: "ses_x",
+    });
+    const result = parseOpenCodeJsonl(stdout);
+    expect(result.errorMessage).toContain("ProviderAuthError");
+  });
+
+  it("uses error.code when no message/name", () => {
+    const stdout = JSON.stringify({
+      type: "error",
+      error: { code: "E_TIMEOUT" },
+      sessionID: "ses_x",
+    });
+    const result = parseOpenCodeJsonl(stdout);
+    expect(result.errorMessage).toContain("E_TIMEOUT");
+  });
+
+  it("falls back to JSON.stringify of the error object when nothing matches", () => {
+    const stdout = JSON.stringify({
+      type: "error",
+      error: { unexpectedShape: { foo: "bar" } },
+      sessionID: "ses_x",
+    });
+    const result = parseOpenCodeJsonl(stdout);
+    expect(result.errorMessage).toContain("unexpectedShape");
+  });
+});

@@ -323,3 +323,41 @@ describe("parseStdoutLine", () => {
     expect(parseStdoutLine(line, TS)).toEqual([]);
   });
 });
+
+describe("parseStdoutLine — error edge cases", () => {
+  const TS_ERR = "2026-04-25T22:00:00.000Z";
+
+  it("returns stdout entry when JSON parses to a primitive (not an object)", () => {
+    const result = parseStdoutLine("42", TS_ERR);
+    // safeJsonParse returns null for non-object → falls through to stdout entry
+    expect(result).toEqual([{ kind: "stdout", ts: TS_ERR, text: "42" }]);
+  });
+
+  it("returns empty for text event with empty text", () => {
+    const line = JSON.stringify({ type: "text", part: { text: "" } });
+    expect(parseStdoutLine(line, TS_ERR)).toEqual([]);
+  });
+
+  it("returns empty for assistant event with no content blocks", () => {
+    const line = JSON.stringify({ type: "assistant", part: { message: { content: null } } });
+    expect(parseStdoutLine(line, TS_ERR)).toEqual([]);
+  });
+
+  it("returns empty for error event whose error field is an empty string", () => {
+    const line = JSON.stringify({ type: "error", error: "" });
+    expect(parseStdoutLine(line, TS_ERR)).toEqual([]);
+  });
+
+  it("uses error.code fallback when error has no message/data/name", () => {
+    const line = JSON.stringify({ type: "error", error: { code: "E_FOO" } });
+    const result = parseStdoutLine(line, TS_ERR);
+    expect(result).toEqual([{ kind: "stderr", ts: TS_ERR, text: "E_FOO" }]);
+  });
+
+  it("falls back to JSON.stringify of error object when no known field", () => {
+    const line = JSON.stringify({ type: "error", error: { somethingElse: "x" } });
+    const result = parseStdoutLine(line, TS_ERR);
+    expect(result[0].kind).toBe("stderr");
+    expect((result[0] as { text: string }).text).toContain("somethingElse");
+  });
+});

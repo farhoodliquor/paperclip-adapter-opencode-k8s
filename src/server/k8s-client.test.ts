@@ -28,13 +28,14 @@ vi.mock("@kubernetes/client-node", () => {
     }
   }
   class KubeConfig {
-    loadFromCluster() {}
-    loadFromFile() {}
+    loadFromCluster = mockLoadFromCluster;
+    loadFromFile = mockLoadFromFile;
     makeApiClient() {
       return {
         readNamespacedPersistentVolumeClaim: mockReadNamespacedPVC,
         deleteNamespacedPersistentVolumeClaim: mockDeleteNamespacedPVC,
         createNamespacedPersistentVolumeClaim: mockCreateNamespacedPVC,
+        readNamespacedPod: mockReadNamespacedPod,
       };
     }
   }
@@ -51,9 +52,17 @@ vi.mock("@kubernetes/client-node", () => {
 const mockReadNamespacedPVC = vi.fn();
 const mockDeleteNamespacedPVC = vi.fn();
 const mockCreateNamespacedPVC = vi.fn();
+const mockReadNamespacedPod = vi.fn();
+const mockLoadFromCluster = vi.fn();
+const mockLoadFromFile = vi.fn();
+const mockReadFileSync = vi.fn();
+
+vi.mock("node:fs", () => ({
+  readFileSync: (...args: unknown[]) => mockReadFileSync(...args),
+}));
 
 import * as k8s from "@kubernetes/client-node";
-import { getPvc, createPvc, deletePvc, resetCache } from "./k8s-client.js";
+import { getPvc, createPvc, deletePvc, getSelfPodInfo, resetCache } from "./k8s-client.js";
 
 const ApiException = (k8s as unknown as { ApiException: new <T>(code: number, message: string, body: T, headers?: Record<string, string>) => Error & { code: number; body: T } }).ApiException;
 
@@ -141,5 +150,147 @@ describe("createPvc — passes through to SDK", () => {
     const result = await createPvc("paperclip", spec as never);
     expect(result).toEqual(spec);
     expect(mockCreateNamespacedPVC).toHaveBeenCalledWith({ namespace: "paperclip", body: spec });
+  });
+});
+
+describe("getSelfPodInfo", () => {
+  const HOSTNAME = "paperclip-test-pod";
+  const NAMESPACE = "paperclip-test";
+
+  beforeEach(() => {
+    process.env.HOSTNAME = HOSTNAME;
+    delete process.env.PAPERCLIP_NAMESPACE;
+    delete process.env.POD_NAMESPACE;
+    mockReadFileSync.mockReturnValue(NAMESPACE);
+  });
+
+  function basePod(overrides: Record<string, unknown> = {}) {
+    return {
+      spec: {
+        containers: [
+          {
+            name: "paperclip",
+            image: "paperclip:1.0",
+            env: [
+              { name: "FOO", value: "bar" },
+              { name: "SECRET_REF", valueFrom: { secretKeyRef: { name: "s", key: "k" } } },
+            ],
+            envFrom: [{ configMapRef: { name: "cm" } }],
+            volumeMounts: [
+              { name: "data", mountPath: "/paperclip" },
+              { name: "tls-secret", mountPath: "/etc/tls" },
+            ],
+          },
+        ],
+        volumes: [
+          { name: "data", persistentVolumeClaim: { claimName: "paperclip-pvc" } },
+          { name: "tls-secret", secret: { secretName: "tls", defaultMode: 0o400 } },
+        ],
+        imagePullSecrets: [{ name: "registry-creds" }, { name: "" }, {}],
+        dnsConfig: { nameservers: ["10.0.0.10"] },
+        ...overrides,
+      },
+    };
+  }
+
+  it("introspects the pod and extracts image, env, PVC, secrets, dnsConfig", async () => {
+    mockReadNamespacedPod.mockResolvedValue(basePod());
+    const info = await getSelfPodInfo();
+    expect(info.namespace).toBe(NAMESPACE);
+    expect(info.image).toBe("paperclip:1.0");
+    expect(info.pvcClaimName).toBe("paperclip-pvc");
+    expect(info.inheritedEnv).toEqual({ FOO: "bar" });
+    expect(info.inheritedEnvValueFrom).toHaveLength(1);
+    expect(info.inheritedEnvValueFrom[0].name).toBe("SECRET_REF");
+    expect(info.inheritedEnvFrom).toHaveLength(1);
+    expect(info.secretVolumes).toEqual([
+      { volumeName: "tls-secret", secretName: "tls", mountPath: "/etc/tls", defaultMode: 0o400 },
+    ]);
+    // imagePullSecrets with empty name are filtered out
+    expect(info.imagePullSecrets).toEqual([{ name: "registry-creds" }]);
+    expect(info.dnsConfig).toEqual({ nameservers: ["10.0.0.10"] });
+    expect(mockReadNamespacedPod).toHaveBeenCalledWith({ name: HOSTNAME, namespace: NAMESPACE });
+  });
+
+  it("caches the result — second call does not re-query the API", async () => {
+    mockReadNamespacedPod.mockResolvedValue(basePod());
+    await getSelfPodInfo();
+    await getSelfPodInfo();
+    expect(mockReadNamespacedPod).toHaveBeenCalledTimes(1);
+  });
+
+  it("prefers PAPERCLIP_NAMESPACE env over service-account file", async () => {
+    process.env.PAPERCLIP_NAMESPACE = "from-env";
+    mockReadNamespacedPod.mockResolvedValue(basePod());
+    const info = await getSelfPodInfo();
+    expect(info.namespace).toBe("from-env");
+    expect(mockReadFileSync).not.toHaveBeenCalled();
+  });
+
+  it("falls back to POD_NAMESPACE when PAPERCLIP_NAMESPACE not set", async () => {
+    process.env.POD_NAMESPACE = "downward-api";
+    mockReadNamespacedPod.mockResolvedValue(basePod());
+    const info = await getSelfPodInfo();
+    expect(info.namespace).toBe("downward-api");
+  });
+
+  it("falls back to 'default' when service-account file read throws", async () => {
+    mockReadFileSync.mockImplementation(() => {
+      throw new Error("ENOENT");
+    });
+    mockReadNamespacedPod.mockResolvedValue(basePod());
+    const info = await getSelfPodInfo();
+    expect(info.namespace).toBe("default");
+  });
+
+  it("throws when HOSTNAME is not set", async () => {
+    delete process.env.HOSTNAME;
+    await expect(getSelfPodInfo()).rejects.toThrow("HOSTNAME env var not set");
+  });
+
+  it("throws when pod has no spec", async () => {
+    mockReadNamespacedPod.mockResolvedValue({ spec: null });
+    await expect(getSelfPodInfo()).rejects.toThrow("has no spec");
+  });
+
+  it("throws when main container has no image", async () => {
+    mockReadNamespacedPod.mockResolvedValue({
+      spec: { containers: [{ name: "paperclip", image: "" }] },
+    });
+    await expect(getSelfPodInfo()).rejects.toThrow("has no container image");
+  });
+
+  it("falls back to first container when no container is named 'paperclip'", async () => {
+    mockReadNamespacedPod.mockResolvedValue({
+      spec: { containers: [{ name: "other", image: "other:1.0" }] },
+    });
+    const info = await getSelfPodInfo();
+    expect(info.image).toBe("other:1.0");
+  });
+
+  it("returns null pvcClaimName when no /paperclip mount exists", async () => {
+    mockReadNamespacedPod.mockResolvedValue({
+      spec: { containers: [{ name: "paperclip", image: "p:1", volumeMounts: [] }] },
+    });
+    const info = await getSelfPodInfo();
+    expect(info.pvcClaimName).toBeNull();
+  });
+
+  it("returns null pvcClaimName when /paperclip mount is not backed by a PVC", async () => {
+    mockReadNamespacedPod.mockResolvedValue({
+      spec: {
+        containers: [{ name: "paperclip", image: "p:1", volumeMounts: [{ name: "data", mountPath: "/paperclip" }] }],
+        volumes: [{ name: "data", emptyDir: {} }],
+      },
+    });
+    const info = await getSelfPodInfo();
+    expect(info.pvcClaimName).toBeNull();
+  });
+
+  it("uses kubeconfig file path when provided (not in-cluster)", async () => {
+    mockReadNamespacedPod.mockResolvedValue(basePod());
+    await getSelfPodInfo("/tmp/kubeconfig.yaml");
+    expect(mockLoadFromFile).toHaveBeenCalledWith("/tmp/kubeconfig.yaml");
+    expect(mockLoadFromCluster).not.toHaveBeenCalled();
   });
 });

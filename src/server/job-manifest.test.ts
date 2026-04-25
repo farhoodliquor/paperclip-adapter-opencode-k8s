@@ -406,3 +406,110 @@ describe("sanitizeLabelValue", () => {
     expect(warned.length).toBe(1);
   });
 });
+
+describe("buildJobManifest — env wiring branches", () => {
+  it("sets PAPERCLIP_WAKE_PAYLOAD_JSON when paperclipWake is provided", () => {
+    const ctx = { ...mockCtx, context: { ...mockCtx.context, paperclipWake: { reason: "issue_assigned", issue: { id: "x" } } } };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const env = result.job.spec?.template.spec?.containers[0]?.env ?? [];
+    expect(env.find((e) => e.name === "PAPERCLIP_WAKE_PAYLOAD_JSON")?.value).toBeTruthy();
+  });
+
+  it("forwards workspace context and AGENT_HOME from paperclipWorkspace", () => {
+    const ctx = {
+      ...mockCtx,
+      context: {
+        ...mockCtx.context,
+        paperclipWorkspace: {
+          cwd: "/work",
+          source: "main",
+          strategy: "shared",
+          workspaceId: "ws_1",
+          repoUrl: "https://example.com/r.git",
+          repoRef: "main",
+          branchName: "feature/x",
+          worktreePath: "/wt/x",
+          agentHome: "/home/agent",
+        },
+      },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const env = result.job.spec?.template.spec?.containers[0]?.env ?? [];
+    expect(env.find((e) => e.name === "PAPERCLIP_WORKSPACE_CWD")?.value).toBe("/work");
+    expect(env.find((e) => e.name === "PAPERCLIP_WORKSPACE_BRANCH")?.value).toBe("feature/x");
+    expect(env.find((e) => e.name === "AGENT_HOME")?.value).toBe("/home/agent");
+  });
+
+  it("sets PAPERCLIP_LINKED_ISSUE_IDS from non-empty issueIds array (skipping blanks)", () => {
+    const ctx = { ...mockCtx, context: { ...mockCtx.context, issueIds: ["a", "  ", "b", null as unknown as string, "c"] } };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const env = result.job.spec?.template.spec?.containers[0]?.env ?? [];
+    expect(env.find((e) => e.name === "PAPERCLIP_LINKED_ISSUE_IDS")?.value).toBe("a,b,c");
+  });
+
+  it("encodes paperclipWorkspaces / paperclipRuntimeServiceIntents / paperclipRuntimeServices as JSON env", () => {
+    const ctx = {
+      ...mockCtx,
+      context: {
+        ...mockCtx.context,
+        paperclipWorkspaces: [{ id: "w1" }],
+        paperclipRuntimeServiceIntents: [{ name: "redis" }],
+        paperclipRuntimeServices: [{ name: "redis", url: "redis://r" }],
+        paperclipRuntimePrimaryUrl: "https://primary",
+      },
+    };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const env = result.job.spec?.template.spec?.containers[0]?.env ?? [];
+    expect(env.find((e) => e.name === "PAPERCLIP_WORKSPACES_JSON")?.value).toContain("w1");
+    expect(env.find((e) => e.name === "PAPERCLIP_RUNTIME_SERVICE_INTENTS_JSON")?.value).toContain("redis");
+    expect(env.find((e) => e.name === "PAPERCLIP_RUNTIME_SERVICES_JSON")?.value).toContain("redis://r");
+    expect(env.find((e) => e.name === "PAPERCLIP_RUNTIME_PRIMARY_URL")?.value).toBe("https://primary");
+  });
+
+  it("sets PAPERCLIP_API_KEY from ctx.authToken when provided", () => {
+    const ctx = { ...mockCtx, authToken: "tok_abc" };
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+    const env = result.job.spec?.template.spec?.containers[0]?.env ?? [];
+    expect(env.find((e) => e.name === "PAPERCLIP_API_KEY")?.value).toBe("tok_abc");
+  });
+
+  it("inherits PAPERCLIP_API_URL and PAPERCLIP_DEV_API_KEY from selfPod inheritedEnv", () => {
+    const selfPod = {
+      ...mockSelfPod,
+      inheritedEnv: { PAPERCLIP_API_URL: "http://api", PAPERCLIP_DEV_API_KEY: "dev_key" },
+    };
+    const result = buildJobManifest({ ctx: mockCtx, selfPod });
+    const env = result.job.spec?.template.spec?.containers[0]?.env ?? [];
+    expect(env.find((e) => e.name === "PAPERCLIP_API_URL")?.value).toBe("http://api");
+    expect(env.find((e) => e.name === "PAPERCLIP_DEV_API_KEY")?.value).toBe("dev_key");
+  });
+});
+
+describe("buildJobManifest — volume wiring branches", () => {
+  it("mounts the prompt secret volume when promptSecretName is provided", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, promptSecretName: "prompt-x" });
+    const volumes = result.job.spec?.template.spec?.volumes ?? [];
+    expect(volumes.find((v) => v.name === "prompt-secret")?.secret?.secretName).toBe("prompt-x");
+  });
+
+  it("mounts the data PVC at /paperclip when selfPod has a pvcClaimName", () => {
+    const selfPod = { ...mockSelfPod, pvcClaimName: "paperclip-data" };
+    const result = buildJobManifest({ ctx: mockCtx, selfPod });
+    const volumes = result.job.spec?.template.spec?.volumes ?? [];
+    expect(volumes.find((v) => v.name === "data")?.persistentVolumeClaim?.claimName).toBe("paperclip-data");
+    const mounts = result.job.spec?.template.spec?.containers[0]?.volumeMounts ?? [];
+    expect(mounts.find((m) => m.name === "data")?.mountPath).toBe("/paperclip");
+  });
+
+  it("mounts inherited secret volumes from selfPod.secretVolumes", () => {
+    const selfPod = {
+      ...mockSelfPod,
+      secretVolumes: [{ volumeName: "tls", secretName: "tls-secret", mountPath: "/etc/tls", defaultMode: 0o400 }],
+    };
+    const result = buildJobManifest({ ctx: mockCtx, selfPod });
+    const volumes = result.job.spec?.template.spec?.volumes ?? [];
+    expect(volumes.find((v) => v.name === "tls")?.secret?.secretName).toBe("tls-secret");
+    const mounts = result.job.spec?.template.spec?.containers[0]?.volumeMounts ?? [];
+    expect(mounts.find((m) => m.name === "tls")).toEqual({ name: "tls", mountPath: "/etc/tls", readOnly: true });
+  });
+});

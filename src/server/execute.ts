@@ -37,7 +37,7 @@ export function isK8s404(err: unknown): boolean {
   return false;
 }
 
-function parseModelProvider(model: string | null): string | null {
+export function parseModelProvider(model: string | null): string | null {
   if (!model) return null;
   const trimmed = model.trim();
   if (!trimmed.includes("/")) return null;
