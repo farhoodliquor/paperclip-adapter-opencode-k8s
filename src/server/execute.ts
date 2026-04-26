@@ -126,7 +126,11 @@ async function waitForPod(
       (c) => c.type === "PodScheduled" && c.status === "False" && c.reason === "Unschedulable",
     );
     if (unschedulable) {
-      throw new Error(`Pod unschedulable: ${unschedulable.message ?? "insufficient resources"}`);
+      const msg = unschedulable.message ?? "insufficient resources";
+      if (/pvc|volume|bind|mount/i.test(msg)) {
+        throw new Error(`PVC bind failed: ${msg}`);
+      }
+      throw new Error(`Pod unschedulable: ${msg}`);
     }
 
     for (const cs of containerStatuses) {
@@ -136,6 +140,18 @@ async function waitForPod(
       }
       if (waiting?.reason === "CrashLoopBackOff") {
         throw new Error(`Container "${cs.name}" crash loop: ${waiting.message ?? waiting.reason}`);
+      }
+      if (waiting?.reason === "MountVolumeFailed" || waiting?.reason === "ContainerCannotMount") {
+        throw new Error(`Volume mount failed for "${cs.name}": ${waiting.message ?? waiting.reason}`);
+      }
+    }
+
+    for (const cs of containerStatuses) {
+      const terminated = cs.state?.terminated;
+      if (terminated?.exitCode !== undefined && terminated.exitCode !== 0) {
+        if (terminated.reason === "ContainerCannotMount" || terminated.reason === "MountVolumeFailed") {
+          throw new Error(`Volume mount failed for "${cs.name}": ${terminated.message ?? terminated.reason}`);
+        }
       }
     }
 
