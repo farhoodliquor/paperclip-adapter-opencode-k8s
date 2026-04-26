@@ -44,6 +44,17 @@ describe("buildJobManifest", () => {
     expect(container?.image).toBe("paperclip/paperclip:latest");
   });
 
+  it("uses config.image when provided, overriding selfPod image", () => {
+    const ctxWithImage = {
+      ...mockCtx,
+      config: { image: "my-custom-image:v1.2.3" },
+    };
+    const result = buildJobManifest({ ctx: ctxWithImage, selfPod: mockSelfPod });
+
+    const container = result.job.spec?.template?.spec?.containers?.[0];
+    expect(container?.image).toBe("my-custom-image:v1.2.3");
+  });
+
   it("sets fsGroupChangePolicy to OnRootMismatch", () => {
     const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
 
