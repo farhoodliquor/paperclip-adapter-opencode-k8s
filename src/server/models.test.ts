@@ -8,7 +8,7 @@ vi.mock("child_process", () => ({
   },
 }));
 
-const { listK8sModels } = await import("./models.js");
+const { listK8sModels, STATIC_MODELS } = await import("./models.js");
 
 function mockExecResult(stdout: string) {
   execMock.mockImplementation((_cmd, _opts, cb) => {
@@ -71,8 +71,15 @@ describe("listK8sModels", () => {
 
     const models = await listK8sModels();
 
+    expect(models).toBe(STATIC_MODELS);
     expect(models.length).toBeGreaterThan(0);
-    expect(models.map((m) => m.id)).toContain("anthropic/claude-opus-4-7");
-    expect(models.map((m) => m.id)).toContain("openai/gpt-4o");
+  });
+
+  it("falls back to the static list when the CLI returns empty stdout", async () => {
+    mockExecResult("");
+
+    const models = await listK8sModels();
+
+    expect(models).toBe(STATIC_MODELS);
   });
 });
