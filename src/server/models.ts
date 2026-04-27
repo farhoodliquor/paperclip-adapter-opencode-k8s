@@ -3,6 +3,15 @@ import os from "node:os";
 import type { AdapterModel } from "@paperclipai/adapter-utils";
 import { asString, ensurePathInEnv, runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 
+export const STATIC_MODELS: AdapterModel[] = [
+  { id: "anthropic/claude-opus-4-7", label: "anthropic/claude-opus-4-7" },
+  { id: "anthropic/claude-sonnet-4-6", label: "anthropic/claude-sonnet-4-6" },
+  { id: "anthropic/claude-haiku-4-5", label: "anthropic/claude-haiku-4-5" },
+  { id: "openai/gpt-4o", label: "openai/gpt-4o" },
+  { id: "google/gemini-2.5-pro", label: "google/gemini-2.5-pro" },
+  { id: "google/gemini-2.5-flash", label: "google/gemini-2.5-flash" },
+];
+
 const MODELS_CACHE_TTL_MS = 60_000;
 const MODELS_DISCOVERY_TIMEOUT_MS = 20_000;
 
