@@ -13,6 +13,16 @@ npm run test:watch # Run vitest in watch mode
 
 Run a single test file: `npx vitest run src/server/parse.test.ts`
 
+## Publishing
+
+Bump `version` in `package.json`, commit, push to `master`, then push a matching tag — the CI publish job only runs on `v*` tags:
+
+```bash
+git tag v0.1.x && git push origin v0.1.x
+```
+
+The workflow verifies the tag matches `package.json` version before publishing to npm.
+
 ## Architecture
 
 This is a Paperclip adapter plugin that runs OpenCode agents as isolated Kubernetes Job pods. It exposes three entry points:
