@@ -1,85 +1,154 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-const execMock = vi.fn();
+const runChildProcessMock = vi.fn();
 
-vi.mock("child_process", () => ({
-  exec: (cmd: string, opts: unknown, cb: (err: Error | null, result: { stdout: string; stderr: string }) => void) => {
-    execMock(cmd, opts, cb);
-  },
-}));
+vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@paperclipai/adapter-utils/server-utils")>();
+  return { ...actual, runChildProcess: runChildProcessMock };
+});
 
-const { listK8sModels, STATIC_MODELS } = await import("./models.js");
+const { listK8sModels, discoverK8sModels, resetK8sModelsCacheForTests } = await import("./models.js");
 
-function mockExecResult(stdout: string) {
-  execMock.mockImplementation((_cmd, _opts, cb) => {
-    cb(null, { stdout, stderr: "" });
-  });
+type MockResult = { exitCode: number | null; stdout: string; stderr: string; timedOut: boolean };
+
+function mockSuccess(stdout: string): void {
+  runChildProcessMock.mockResolvedValue({ exitCode: 0, stdout, stderr: "", timedOut: false } satisfies MockResult);
 }
 
-function mockExecError(err: Error) {
-  execMock.mockImplementation((_cmd, _opts, cb) => {
-    cb(err, { stdout: "", stderr: "" });
-  });
+function mockFailure(stderr = "ENOENT: opencode not found"): void {
+  runChildProcessMock.mockResolvedValue({ exitCode: 1, stdout: "", stderr, timedOut: false } satisfies MockResult);
+}
+
+function mockTimeout(): void {
+  runChildProcessMock.mockResolvedValue({ exitCode: null, stdout: "", stderr: "", timedOut: true } satisfies MockResult);
 }
 
 describe("listK8sModels", () => {
-  beforeEach(() => {
-    execMock.mockReset();
+  afterEach(() => {
+    runChildProcessMock.mockReset();
+    resetK8sModelsCacheForTests();
   });
 
-  it("parses opencode models output into AdapterModel entries", async () => {
-    mockExecResult(
-      [
-        "anthropic/claude-opus-4-7",
-        "openai/gpt-4o",
-        "google/gemini-2.5-pro",
-      ].join("\n"),
-    );
+  it("parses provider/model lines into AdapterModel entries", async () => {
+    mockSuccess(["anthropic/claude-opus-4-7", "openai/gpt-4o", "google/gemini-2.5-pro"].join("\n"));
 
     const models = await listK8sModels();
 
     expect(models).toHaveLength(3);
-    expect(models[0]).toEqual({ id: "anthropic/claude-opus-4-7", label: "claude opus 4 7" });
-    expect(models[1]).toEqual({ id: "openai/gpt-4o", label: "gpt 4o" });
-    expect(models[2]).toEqual({ id: "google/gemini-2.5-pro", label: "gemini 2.5 pro" });
+    expect(models.find((m) => m.id === "anthropic/claude-opus-4-7")).toEqual({
+      id: "anthropic/claude-opus-4-7",
+      label: "anthropic/claude-opus-4-7",
+    });
   });
 
   it("ignores blank lines and trims whitespace", async () => {
-    mockExecResult("\nanthropic/claude-opus-4-7\n\n  openai/gpt-4o  \n\n");
+    mockSuccess("\nanthropic/claude-opus-4-7\n\n  openai/gpt-4o  \n\n");
 
     const models = await listK8sModels();
 
-    expect(models.map((m) => m.id)).toEqual([
-      "anthropic/claude-opus-4-7",
-      "openai/gpt-4o",
-    ]);
+    expect(models.map((m) => m.id)).toEqual(
+      ["anthropic/claude-opus-4-7", "openai/gpt-4o"].sort(),
+    );
   });
 
-  it("invokes opencode models with a timeout", async () => {
-    mockExecResult("anthropic/claude-opus-4-7");
+  it("skips lines without a provider/model slash", async () => {
+    mockSuccess("anthropic/claude-opus-4-7\nnot-a-model-line\nopenai/gpt-4o");
+
+    const models = await listK8sModels();
+
+    expect(models.map((m) => m.id)).not.toContain("not-a-model-line");
+    expect(models).toHaveLength(2);
+  });
+
+  it("deduplicates repeated model IDs", async () => {
+    mockSuccess("anthropic/claude-opus-4-7\nanthropic/claude-opus-4-7\nopenai/gpt-4o");
+
+    const models = await listK8sModels();
+
+    expect(models.filter((m) => m.id === "anthropic/claude-opus-4-7")).toHaveLength(1);
+  });
+
+  it("returns models sorted alphabetically by ID", async () => {
+    mockSuccess("openai/gpt-4o\nanthropic/claude-opus-4-7");
+
+    const models = await listK8sModels();
+
+    expect(models[0].id).toBe("anthropic/claude-opus-4-7");
+    expect(models[1].id).toBe("openai/gpt-4o");
+  });
+
+  it("returns empty array when the CLI fails", async () => {
+    mockFailure("ENOENT: opencode not found");
+
+    expect(await listK8sModels()).toEqual([]);
+  });
+
+  it("returns empty array when the CLI times out", async () => {
+    mockTimeout();
+
+    expect(await listK8sModels()).toEqual([]);
+  });
+
+  it("returns empty array when the CLI returns empty stdout", async () => {
+    mockSuccess("");
+
+    expect(await listK8sModels()).toEqual([]);
+  });
+
+  it("caches results and only calls the CLI once within the TTL", async () => {
+    mockSuccess("anthropic/claude-opus-4-7");
 
     await listK8sModels();
+    await listK8sModels();
 
-    expect(execMock).toHaveBeenCalledTimes(1);
-    const [cmd, opts] = execMock.mock.calls[0];
-    expect(cmd).toBe("opencode models");
-    expect(opts).toMatchObject({ timeout: 30_000 });
+    expect(runChildProcessMock).toHaveBeenCalledTimes(1);
   });
 
-  it("falls back to the static list when the CLI fails", async () => {
-    mockExecError(new Error("ENOENT: opencode not found"));
+  it("re-fetches after the cache is reset", async () => {
+    mockSuccess("anthropic/claude-opus-4-7");
 
-    const models = await listK8sModels();
+    await listK8sModels();
+    resetK8sModelsCacheForTests();
+    await listK8sModels();
 
-    expect(models).toBe(STATIC_MODELS);
-    expect(models.length).toBeGreaterThan(0);
+    expect(runChildProcessMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("discoverK8sModels", () => {
+  afterEach(() => {
+    runChildProcessMock.mockReset();
+    resetK8sModelsCacheForTests();
   });
 
-  it("falls back to the static list when the CLI returns empty stdout", async () => {
-    mockExecResult("");
+  it("passes OPENCODE_DISABLE_PROJECT_CONFIG=true to the subprocess", async () => {
+    mockSuccess("anthropic/claude-opus-4-7");
 
-    const models = await listK8sModels();
+    await discoverK8sModels();
 
-    expect(models).toBe(STATIC_MODELS);
+    const [, , , opts] = runChildProcessMock.mock.calls[0] as [unknown, unknown, unknown, { env: Record<string, string> }];
+    expect(opts.env).toMatchObject({ OPENCODE_DISABLE_PROJECT_CONFIG: "true" });
+  });
+
+  it("invokes opencode with the models subcommand", async () => {
+    mockSuccess("anthropic/claude-opus-4-7");
+
+    await discoverK8sModels();
+
+    const [, command, args] = runChildProcessMock.mock.calls[0] as [unknown, string, string[]];
+    expect(command).toBe("opencode");
+    expect(args).toEqual(["models"]);
+  });
+
+  it("throws when the CLI exits non-zero", async () => {
+    mockFailure("provider not configured");
+
+    await expect(discoverK8sModels()).rejects.toThrow("opencode models` failed");
+  });
+
+  it("throws when the CLI times out", async () => {
+    mockTimeout();
+
+    await expect(discoverK8sModels()).rejects.toThrow("timed out");
   });
 });

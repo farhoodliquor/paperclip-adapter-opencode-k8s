@@ -6,10 +6,12 @@ Paperclip adapter plugin that runs OpenCode agents as isolated Kubernetes Jobs i
 
 - Spawns agent runs as K8s Jobs with full pod isolation
 - Inherits container image, secrets, DNS, and PVC from the Paperclip Deployment automatically
-- Real-time log streaming from Job pods back to the Paperclip UI
+- Real-time log streaming from Job pods back to the Paperclip UI with automatic reconnect and replay deduplication
 - Session resume via shared RWX PVC
 - Per-agent concurrency guard
-- Configurable resources, namespace, kubeconfig
+- Skills bundle injection — skill markdown content prepended to each run prompt at execution time
+- Optional per-agent database PVC (`agentDbMode: dedicated_pvc`) for persistent agent state across runs
+- Configurable resources, namespace, kubeconfig, node selectors, and tolerations
 - Runtime config injection for permission bypass
 
 ## Prerequisites
@@ -96,15 +98,15 @@ rules:
     resources: ["namespaces"]
     verbs: ["get"]
 
-  # Verify the RWX PVC exists and has the correct access mode
+  # Verify the RWX PVC; create/delete per-agent DB PVCs (agentDbMode: dedicated_pvc)
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    verbs: ["get"]
+    verbs: ["get", "create", "delete"]
 
-  # Verify optional secrets exist (e.g. paperclip-secrets)
+  # Verify optional secrets; create/delete prompt-delivery Secrets for large prompts (> 256 KiB)
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get"]
+    verbs: ["create", "delete", "get"]
 
   # RBAC self-test during adapter validation
   - apiGroups: ["authorization.k8s.io"]
@@ -172,17 +174,40 @@ curl -X POST http://localhost:3100/api/adapters \
 
 Agent-level configuration fields:
 
+**Core**
+
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `model` | **yes** | — | OpenCode model in `provider/model` format |
 | `variant` | no | — | Reasoning profile variant |
+| `instructionsFilePath` | no | — | Absolute path to a markdown file prepended to every run prompt (e.g. `/paperclip/.claude/projects/COMPANY/agents/AGENT/AGENTS.md`) |
+| `dangerouslySkipPermissions` | no | `true` | Inject runtime config granting `permission.external_directory=allow` |
+| `agentDbMode` | no | `ephemeral` | `ephemeral` (emptyDir, lost on exit) or `dedicated_pvc` (per-agent RWX PVC at `/opencode-db`) |
+| `agentDbStorageClass` | no | Cluster default | StorageClass for dedicated agent DB PVC |
+| `agentDbStorageCapacity` | no | `10Gi` | Storage size for dedicated agent DB PVC |
+
+**Kubernetes**
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
 | `namespace` | no | Deployment namespace | K8s namespace for agent Jobs |
 | `image` | no | Deployment image | Override container image for Jobs |
+| `imagePullPolicy` | no | — | Image pull policy for Job pods |
 | `kubeconfig` | no | In-cluster | Path to kubeconfig file |
 | `serviceAccountName` | no | Default SA | Service account for Job pods |
 | `resources` | no | See below | CPU/memory requests and limits |
+| `nodeSelector` | no | — | Node selector key=value pairs (one per line) |
+| `tolerations` | no | — | Pod tolerations in YAML format |
+| `ttlSecondsAfterFinished` | no | `300` | Seconds before completed Jobs are auto-deleted |
+| `retainJobs` | no | `false` | Keep completed Jobs for debugging (disables TTL) |
+| `reattachOrphanedJobs` | no | `false` | Resume streaming if a matching Job is already running after adapter restart |
+
+**Operational**
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
 | `timeoutSec` | no | `0` (none) | Run timeout in seconds |
-| `retainJobs` | no | `false` | Keep completed Jobs for debugging |
+| `graceSec` | no | `30` | Grace period after timeout before forceful termination |
 | `env` | no | — | Additional environment variables for Jobs |
 
 ### Default Resource Requests and Limits
@@ -201,11 +226,13 @@ resources:
 
 ## How It Works
 
-1. **Self-introspection** — on first run, the adapter reads the Paperclip Deployment pod's own spec to discover the PVC claim name, mounted secrets, image pull secrets, DNS config, and environment variables.
-2. **Job creation** — each agent run creates a Kubernetes Job in the target namespace. The Job pod mounts the same RWX PVC at `/paperclip`, inherits all secrets and env vars, and runs the agent command.
-3. **Log streaming** — the adapter streams stdout/stderr from the Job pod back to the Paperclip UI in real time.
-4. **Concurrency guard** — only one Job per agent is allowed at a time (enforced via label selectors).
-5. **Cleanup** — completed Jobs are automatically deleted after 300 seconds (`ttlSecondsAfterFinished`), or retained if `retainJobs` is enabled.
+1. **Self-introspection** — on first run, the adapter reads the Paperclip Deployment pod's own spec to discover the PVC claim name, mounted secrets, image pull secrets, DNS config, and environment variables. This is cached for all subsequent runs in the same process.
+2. **Concurrency guard** — only one Job per agent is allowed at a time, enforced via K8s label selectors before Job creation.
+3. **Prompt assembly** — instructions file, skills markdown bundle, bootstrap prompt, session handoff, and heartbeat are concatenated in order. Prompts under 256 KiB are delivered via environment variable; larger prompts are written to a K8s Secret and copied into the pod by a busybox init container.
+4. **Agent DB PVC** — if `agentDbMode: dedicated_pvc`, a per-agent RWX PVC named `opencode-db-{agentId}` is created if it does not exist, then mounted at `/opencode-db` with `OPENCODE_DB=/opencode-db`.
+5. **Job creation** — a Kubernetes Job is created in the target namespace. The Job pod mounts the shared RWX PVC at `/paperclip`, inherits all secrets and env vars, and runs the OpenCode agent.
+6. **Log streaming** — the adapter streams stdout/stderr from the Job pod back to the Paperclip UI in real time, with automatic reconnect on K8s API drops and replay deduplication to avoid duplicate output.
+7. **Cleanup** — completed Jobs are automatically deleted after `ttlSecondsAfterFinished` seconds (default 300), or retained if `retainJobs` is enabled.
 
 ### Security Context
 
@@ -220,7 +247,7 @@ All Job pods run with a locked-down security context:
 ## Dependencies
 
 - `@kubernetes/client-node` ^1.0.0
-- `@paperclipai/adapter-utils` >=2026.411.0-canary.8 (peer dependency)
+- `@paperclipai/adapter-utils` >=2026.415.0-canary.7 (peer dependency)
 
 ## License
 

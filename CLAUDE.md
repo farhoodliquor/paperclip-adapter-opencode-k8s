@@ -20,23 +20,24 @@ This is a Paperclip adapter plugin that runs OpenCode agents as isolated Kuberne
 - `.` → `src/index.ts` — main ServerAdapterModule factory
 - `./server` → `src/server/index.ts` — server adapter internals
 - `./ui-parser` → `src/ui-parser.ts` — real-time stdout line parser for the Paperclip UI
+- `./cli` → `src/cli/index.ts` — CLI adapter module with console output formatter
 
 ### Execution Flow (`src/server/execute.ts`)
 
 1. **Concurrency guard** — checks for existing running Jobs for the same agent (shared PVC/session enforcement)
 2. **Self-pod introspection** (`getSelfPodInfo`) — queries own pod to inherit image, imagePullSecrets, DNS config, PVC mount, and all env vars from the Deployment
 3. **Instructions + skill bundle resolution** — reads `instructionsFilePath` from config and desired skill markdown files from the PVC; content is prepended to the prompt at build time
-4. **Job manifest build** (`buildJobManifest`) — constructs a K8s Job with:
-   - Init container (busybox) that writes the prompt to an emptyDir volume
-   - Main opencode container that pipes the prompt via stdin
+4. **Agent DB PVC management** — if `agentDbMode: dedicated_pvc`, ensures a per-agent RWX PVC named `opencode-db-{agentId}` exists (creates it if missing), then mounts it at `/opencode-db` with `OPENCODE_DB=/opencode-db`; defaults to ephemeral emptyDir
+5. **Job manifest build** (`buildJobManifest`) — constructs a K8s Job with:
+   - Prompt delivery: small prompts (< 256 KiB) via env var; large prompts via K8s Secret + busybox init container that copies to emptyDir, then piped via stdin
    - Prompt assembled as: `[instructionsContent] + [skillsBundleContent] + bootstrapPrompt + wakePrompt + sessionHandoff + heartbeatPrompt`
-   - Inherited env vars layered: Deployment env → PAPERCLIP_* vars → user overrides
+   - Inherited env vars layered: Deployment env → PAPERCLIP_* vars → user overrides; always sets `HOME=/paperclip` and `OPENCODE_DISABLE_PROJECT_CONFIG=true`
    - Resource requests/limits, security contexts, tolerations, nodeSelector applied from config
-5. **Job creation** — creates the Job in the target namespace
-6. **Pod scheduling wait** — polls for the pod to be scheduled, checking init container states and image pull issues
-7. **Log streaming + completion wait** — streams pod logs to the Paperclip UI while waiting for Job completion (with configurable timeout)
-8. **JSONL parsing** (`parseOpenCodeJsonl`) — extracts session ID, usage tokens, cost, summary, and errors from OpenCode JSONL output
-9. **Result synthesis** — returns exit code, usage metrics, session params for resume, and billing type inference
+6. **Job creation** — creates the Job in the target namespace
+7. **Pod scheduling wait** — polls for the pod to be scheduled, checking init container states and image pull issues
+8. **Log streaming + completion wait** — streams pod logs with automatic reconnect on K8s API drops; `LogLineDedupFilter` (`log-dedup.ts`) deduplicates replayed lines on reconnect using structural keys (`type:sessionID:partId` for JSONL events, `raw:{content}` for plain lines)
+9. **JSONL parsing** (`parseOpenCodeJsonl`) — extracts session ID, usage tokens, cost, summary, and errors from OpenCode JSONL output
+10. **Result synthesis** — returns exit code, usage metrics, session params for resume, and billing type inference
 
 ### Skill Materialization (`src/server/skills.ts` + `src/server/execute.ts`)
 
@@ -84,5 +85,7 @@ src/
     session.ts        — sessionCodec (serialize/deserialize session params)
     config-schema.ts  — getConfigSchema() (adapter UI config fields)
     test.ts           — testEnvironment() (K8s environment health checks)
+    models.ts         — static model list + dynamic fetch from `opencode models` CLI (with fallback)
+    log-dedup.ts      — LogLineDedupFilter for reconnect replay deduplication
     *.test.ts         — vitest unit tests
 ```
