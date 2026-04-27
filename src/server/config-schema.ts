@@ -12,13 +12,6 @@ export function getConfigSchema(): AdapterConfigSchema {
         group: "Core",
       },
       {
-        key: "instructionsFilePath",
-        label: "Instructions File Path",
-        type: "text",
-        hint: "Absolute path to a markdown file (e.g. AGENTS.md) prepended as system instructions before the task prompt",
-        group: "Core",
-      },
-      {
         key: "dangerouslySkipPermissions",
         label: "Skip Permission Checks",
         type: "toggle",
