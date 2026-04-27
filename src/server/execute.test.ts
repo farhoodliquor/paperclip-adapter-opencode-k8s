@@ -56,12 +56,13 @@ const HAPPY_JSONL = [
   JSON.stringify({ type: "step_finish", part: { tokens: { input: 100, output: 50, cache: { read: 20 } }, cost: 0.002 } }),
 ].join("\n");
 
-function makeCtx(configOverrides: Record<string, unknown> = {}, contextOverrides: Record<string, unknown> = {}): AdapterExecutionContext {
+function makeCtx(configOverrides: Record<string, unknown> = {}, contextOverrides: Record<string, unknown> = {}, authToken = "test-auth-token"): AdapterExecutionContext {
   return {
     runId: "run-test-123",
     agent: { id: "agent-id-test", name: "Test Agent", companyId: "co-1", adapterType: null, adapterConfig: null },
     runtime: { sessionId: null, sessionParams: {}, sessionDisplayId: null, taskKey: null },
     config: configOverrides,
+    authToken,
     context: {
       taskId: null,
       issueId: null,
@@ -879,15 +880,10 @@ describe("execute — log dedup (waitForPod status dedup)", () => {
 describe("execute — external cancel polling", () => {
   const KEEPALIVE_MS = 15_000;
 
-  beforeEach(() => {
-    process.env.PAPERCLIP_DEV_API_KEY = "test-key";
-  });
-
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
     delete process.env.PAPERCLIP_API_URL;
-    delete process.env.PAPERCLIP_API_KEY;
     delete process.env.PAPERCLIP_DEV_API_KEY;
   });
 
@@ -895,7 +891,6 @@ describe("execute — external cancel polling", () => {
     vi.useFakeTimers();
 
     process.env.PAPERCLIP_API_URL = "http://test-api";
-    process.env.PAPERCLIP_API_KEY = "test-key";
 
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
@@ -918,7 +913,7 @@ describe("execute — external cancel polling", () => {
     });
     vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
 
-    const ctx = makeCtx({}, { issueId: "issue-test-456" });
+    const ctx = makeCtx({}, { issueId: "issue-test-456" }, "run-jwt-token");
     const executePromise = execute(ctx);
 
     // Advance in 1-second steps. vi.advanceTimersByTimeAsync fires fake timers
@@ -939,7 +934,7 @@ describe("execute — external cancel polling", () => {
     );
     expect(fetchMock).toHaveBeenCalledWith(
       "http://test-api/api/issues/issue-test-456",
-      expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer test-key" }) }),
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer run-jwt-token" }) }),
     );
   });
 
@@ -958,7 +953,6 @@ describe("execute — external cancel polling", () => {
     vi.useFakeTimers();
 
     process.env.PAPERCLIP_API_URL = "http://test-api";
-    process.env.PAPERCLIP_API_KEY = "test-key";
 
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
       ok: true,
@@ -975,6 +969,42 @@ describe("execute — external cancel polling", () => {
     // Should complete normally, not be cancelled.
     expect(result.errorCode).toBeUndefined();
     expect(result.exitCode).toBe(0);
+  });
+
+  it("uses PAPERCLIP_DEV_API_KEY over ctx.authToken when set", async () => {
+    vi.useFakeTimers();
+
+    process.env.PAPERCLIP_API_URL = "http://test-api";
+    process.env.PAPERCLIP_DEV_API_KEY = "dev-override-key";
+
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ status: "cancelled" }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    let jobDeleted = false;
+    const batchApi = makeBatchApi();
+    batchApi.deleteNamespacedJob.mockImplementation(() => { jobDeleted = true; return Promise.resolve({}); });
+    batchApi.readNamespacedJob.mockImplementation(() => {
+      if (jobDeleted) return Promise.reject(Object.assign(new Error("not found"), { statusCode: 404 }));
+      return Promise.resolve({ status: { conditions: [] } });
+    });
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    const ctx = makeCtx({}, { issueId: "issue-test-456" }, "ctx-auth-token");
+    const executePromise = execute(ctx);
+
+    for (let i = 0; i < 20; i++) {
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+
+    await executePromise;
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://test-api/api/issues/issue-test-456",
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer dev-override-key" }) }),
+    );
   });
 });
 
