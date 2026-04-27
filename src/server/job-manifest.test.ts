@@ -484,15 +484,14 @@ describe("buildJobManifest — env wiring branches", () => {
     expect(env.find((e) => e.name === "PAPERCLIP_API_KEY")?.value).toBe("tok_abc");
   });
 
-  it("inherits PAPERCLIP_API_URL and PAPERCLIP_DEV_API_KEY from selfPod inheritedEnv", () => {
+  it("inherits PAPERCLIP_API_URL from selfPod inheritedEnv", () => {
     const selfPod = {
       ...mockSelfPod,
-      inheritedEnv: { PAPERCLIP_API_URL: "http://api", PAPERCLIP_DEV_API_KEY: "dev_key" },
+      inheritedEnv: { PAPERCLIP_API_URL: "http://api" },
     };
     const result = buildJobManifest({ ctx: mockCtx, selfPod });
     const env = result.job.spec?.template.spec?.containers[0]?.env ?? [];
     expect(env.find((e) => e.name === "PAPERCLIP_API_URL")?.value).toBe("http://api");
-    expect(env.find((e) => e.name === "PAPERCLIP_DEV_API_KEY")?.value).toBe("dev_key");
   });
 });
 

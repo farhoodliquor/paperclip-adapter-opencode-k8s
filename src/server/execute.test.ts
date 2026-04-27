@@ -884,7 +884,6 @@ describe("execute — external cancel polling", () => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
     delete process.env.PAPERCLIP_API_URL;
-    delete process.env.PAPERCLIP_DEV_API_KEY;
   });
 
   it("returns errorCode=cancelled and deletes job when issue status is cancelled", async () => {
@@ -969,42 +968,6 @@ describe("execute — external cancel polling", () => {
     // Should complete normally, not be cancelled.
     expect(result.errorCode).toBeUndefined();
     expect(result.exitCode).toBe(0);
-  });
-
-  it("uses PAPERCLIP_DEV_API_KEY over ctx.authToken when set", async () => {
-    vi.useFakeTimers();
-
-    process.env.PAPERCLIP_API_URL = "http://test-api";
-    process.env.PAPERCLIP_DEV_API_KEY = "dev-override-key";
-
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve({ status: "cancelled" }),
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
-    let jobDeleted = false;
-    const batchApi = makeBatchApi();
-    batchApi.deleteNamespacedJob.mockImplementation(() => { jobDeleted = true; return Promise.resolve({}); });
-    batchApi.readNamespacedJob.mockImplementation(() => {
-      if (jobDeleted) return Promise.reject(Object.assign(new Error("not found"), { statusCode: 404 }));
-      return Promise.resolve({ status: { conditions: [] } });
-    });
-    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
-
-    const ctx = makeCtx({}, { issueId: "issue-test-456" }, "ctx-auth-token");
-    const executePromise = execute(ctx);
-
-    for (let i = 0; i < 20; i++) {
-      await vi.advanceTimersByTimeAsync(1_000);
-    }
-
-    await executePromise;
-
-    expect(fetchMock).toHaveBeenCalledWith(
-      "http://test-api/api/issues/issue-test-456",
-      expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer dev-override-key" }) }),
-    );
   });
 });
 

@@ -569,9 +569,7 @@ async function streamAndAwaitJob(
         await new Promise<void>((resolve) => setTimeout(resolve, KEEPALIVE_INTERVAL_MS));
         if (logStopSignal.stopped || cancelSignal.cancelled) break;
         try {
-          // Prefer PAPERCLIP_DEV_API_KEY if set (dev override), otherwise use
-          // the per-run authToken issued by Paperclip for this execution.
-          const apiKey = process.env.PAPERCLIP_DEV_API_KEY ?? ctx.authToken ?? "";
+          const apiKey = ctx.authToken ?? "";
           const resp = await fetch(`${apiUrl}/api/issues/${issueId}`, {
             headers: { Authorization: `Bearer ${apiKey}` },
           });
